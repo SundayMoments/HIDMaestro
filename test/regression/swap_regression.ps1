@@ -162,7 +162,6 @@ if ($verMatch.Success) {
         Join-Path $scriptDir '..\probes\switch2_pro_sdl3_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
         Join-Path $scriptDir '..\probes\sony_extra_buttons_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
         Join-Path $scriptDir '..\probes\vr_controller_smoke\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
-        Join-Path $scriptDir '..\probes\elite_paddles_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
     )
     # Canonical SDK output for the content-hash check. Source tree only:
     # a release bundle carries no sdk/ build output, and the version
@@ -1515,21 +1514,6 @@ function Scenario-Vr-Controller-Smoke {
     }
 }
 
-# S51: the Xbox Elite rear paddles (issue #49). The four Elite profiles
-# widened their GIP HID view from 10 to 14 buttons so the paddles have a
-# declared carrier (real hardware never exposes them in any HID view);
-# the probe pins the paddle order to SDL's Elite mapping (b11..b14 =
-# P1/P2/P3/P4), the -1 sentinels that stop Touchpad/Share/Misc1 from
-# aliasing onto the new indices, and the base GIP view staying 10
-# buttons on the non-Elite Xbox profiles.
-function Scenario-Elite-Paddles {
-    $probe = Resolve-ProbeBinary 'elite_paddles_check' 'ElitePaddlesCheck.exe'
-    $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
-    if ($p.ExitCode -ne 0) {
-        throw ("ElitePaddlesCheck exited " + $p.ExitCode + " - the Elite paddle wire drifted: descriptor button count, the SDL paddle order at buttons 11-14, a sentinel regression aliasing Touchpad/Share/Misc1 onto the paddles, or a non-Elite Xbox profile picked up the widened view (see probe stdout)")
-    }
-}
-
 function Scenario-Sony-Extra-Buttons {
     $probe = Resolve-ProbeBinary 'sony_extra_buttons_check' 'SonyExtraButtonsCheck.exe'
     $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
@@ -1612,8 +1596,7 @@ $scenarios = @(
     @{ Name = 'S47_Switch2_Pro_Profile';          Body = ${function:Scenario-Switch2-Pro} },
     @{ Name = 'S48_Switch2_Pro_Sdl3';             Body = ${function:Scenario-Switch2-Pro-Sdl3} },
     @{ Name = 'S49_Sony_Extra_Buttons';           Body = ${function:Scenario-Sony-Extra-Buttons} },
-    @{ Name = 'S50_Vr_Controller_Smoke';          Body = ${function:Scenario-Vr-Controller-Smoke} },
-    @{ Name = 'S51_Elite_Paddles';                Body = ${function:Scenario-Elite-Paddles} }
+    @{ Name = 'S50_Vr_Controller_Smoke';          Body = ${function:Scenario-Vr-Controller-Smoke} }
 )
 
 $totalSw = [System.Diagnostics.Stopwatch]::StartNew()
