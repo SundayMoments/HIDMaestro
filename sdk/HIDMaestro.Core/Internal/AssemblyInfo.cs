@@ -30,3 +30,4 @@
 [assembly: InternalsVisibleTo("Switch2ProSdl3Check")]
 [assembly: InternalsVisibleTo("SonyExtraButtonsCheck")]
 [assembly: InternalsVisibleTo("VrControllerSmoke")]
+[assembly: InternalsVisibleTo("ElitePaddlesCheck")]
