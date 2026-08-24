@@ -42,6 +42,9 @@ internal sealed class UsbDescriptorSet
     private readonly byte _iManufacturer;
     private readonly byte _iProduct;
     private readonly byte _iSerial;
+    private readonly byte _iConfiguration;
+    private readonly string? _serial;
+    private readonly string? _configurationName;
 
     /// <summary>Endpoint table parsed from the configuration blob. Keyed
     /// by bEndpointAddress (direction bit included).</summary>
@@ -49,9 +52,22 @@ internal sealed class UsbDescriptorSet
     private readonly Dictionary<byte, EndpointInfo> _endpoints = new();
 
     /// <summary>The 9-byte HID class descriptor found inside the config
-    /// blob, and the interface number it belongs to.</summary>
+    /// blob, and the interface number it belongs to. This is the PRIMARY
+    /// HID interface: the one serving the profile's own report descriptor,
+    /// carrying its input reports and answering its feature requests.</summary>
     public byte HidInterfaceNumber { get; }
     private readonly byte[] _hidClassDescriptor;
+
+    /// <summary>Issue #56. Secondary HID interfaces, keyed by interface
+    /// number: the class descriptor found in the blob paired with the
+    /// report descriptor the profile declares for it. A Steam Deck persona
+    /// presents two (keyboard and mouse, the pair its lizard mode drives)
+    /// alongside its vendor controller interface. Empty for every
+    /// single-HID profile, which is all three Sony composites.</summary>
+    private readonly Dictionary<byte, (byte[] ClassDescriptor, byte[] ReportDescriptor)> _secondaryHid = new();
+
+    /// <summary>Interface numbers of the secondary HID interfaces.</summary>
+    public IReadOnlyCollection<byte> SecondaryHidInterfaces => _secondaryHid.Keys;
 
     internal readonly struct EndpointInfo
     {
@@ -72,7 +88,38 @@ internal sealed class UsbDescriptorSet
         public int TransferType => Attributes & 0x03; // 1 iso, 3 interrupt
     }
 
-    public UsbDescriptorSet(ControllerProfile profile)
+    /// <summary>Vary a captured serial per controller instance.
+    ///
+    /// Real units have unique serials and Steam keys its per-controller
+    /// config off the string it reads: the client writes
+    /// <c>configset_&lt;serial&gt;.vdf</c>. Two virtual Decks sharing one
+    /// serial therefore share one configuration, which is wrong the moment
+    /// somebody runs a pair of them.
+    ///
+    /// Instance 0 keeps the captured serial byte for byte, so a single
+    /// controller stays identical to the unit it was dumped from and the
+    /// golden descriptor hashes do not move. Later instances add the index
+    /// into the trailing digit run, which is where a real serial varies and
+    /// which preserves both the length and the character classes the
+    /// manufacturer's format uses.</summary>
+    internal static string? InstanceSerial(string? captured, int index)
+    {
+        if (index <= 0 || string.IsNullOrEmpty(captured)) return captured;
+        var chars = captured.ToCharArray();
+        int at = chars.Length - 1;
+        int carry = index;
+        while (at >= 0 && carry > 0 && char.IsDigit(chars[at]))
+        {
+            int v = (chars[at] - '0') + (carry % 10);
+            carry /= 10;
+            if (v > 9) { v -= 10; carry++; }
+            chars[at] = (char)('0' + v);
+            at--;
+        }
+        return new string(chars);
+    }
+
+    public UsbDescriptorSet(ControllerProfile profile, int index = 0)
     {
         var cfg = profile.UsbConfiguration
             ?? throw new InvalidOperationException($"Profile '{profile.Id}' has no usbConfiguration.");
@@ -93,6 +140,9 @@ internal sealed class UsbDescriptorSet
         _iManufacturer = DeviceDescriptor[14];
         _iProduct = DeviceDescriptor[15];
         _iSerial = DeviceDescriptor[16];
+        _iConfiguration = ConfigurationDescriptor.Length > 6 ? ConfigurationDescriptor[6] : (byte)0;
+        _serial = InstanceSerial(profile.SerialString, index);
+        _configurationName = profile.ConfigurationString;
         _manufacturer = profile.ManufacturerString;
         _product = profile.ProductString;
 
@@ -127,9 +177,25 @@ internal sealed class UsbDescriptorSet
         NumInterfaces = blob[4];
         ConfigurationValue = blob[5];
 
+        // The PRIMARY HID interface is the one the structured spec marks
+        // function "hid"; it serves the profile's own report descriptor. A
+        // single-HID profile (every Sony composite) names exactly one, and
+        // this resolves to the same interface the old first-HID rule found.
+        byte declaredPrimary = 0xFF;
+        foreach (var iface in cfg.Interfaces)
+            if (iface.Function == "hid") { declaredPrimary = iface.InterfaceNumber; break; }
+
+        // Report descriptors the spec declares per interface, for the
+        // secondary HID interfaces (issue #56).
+        var declaredReports = new Dictionary<byte, byte[]>();
+        foreach (var iface in cfg.Interfaces)
+            foreach (var alt in iface.AltSettings)
+                if (!string.IsNullOrEmpty(alt.ReportDescriptor))
+                    declaredReports[iface.InterfaceNumber] = Convert.FromHexString(alt.ReportDescriptor);
+
         byte curIface = 0xFF, curAlt = 0;
         byte hidIface = 0xFF;
-        byte[]? hidClass = null;
+        var classByIface = new Dictionary<byte, byte[]>();
         for (int off = 0; off + 2 <= blob.Length;)
         {
             int len = blob[off];
@@ -151,18 +217,44 @@ internal sealed class UsbDescriptorSet
             }
             else if (type == 0x21) // HID class descriptor
             {
-                hidClass = new byte[len];
-                Array.Copy(blob, off, hidClass, 0, len);
-                int declared = hidClass[7] | (hidClass[8] << 8);
-                if (declared != ReportDescriptor.Length)
-                    throw new InvalidOperationException(
-                        $"HID class descriptor declares a {declared}-byte report descriptor " +
-                        $"but the profile's is {ReportDescriptor.Length} bytes.");
+                var thisClass = new byte[len];
+                Array.Copy(blob, off, thisClass, 0, len);
+                classByIface[curIface] = thisClass;
             }
             off += len;
         }
-        if (hidClass == null || hidIface == 0xFF)
+        if (classByIface.Count == 0 || hidIface == 0xFF)
             throw new InvalidOperationException("configurationDescriptor has no HID interface.");
+
+        // A spec-declared "hid" function wins; otherwise the first HID
+        // interface in the blob, which is the pre-#56 rule verbatim.
+        if (declaredPrimary != 0xFF && classByIface.ContainsKey(declaredPrimary))
+            hidIface = declaredPrimary;
+        byte[] hidClass = classByIface[hidIface];
+
+        // Every HID class descriptor must agree with the descriptor its own
+        // interface serves: the profile's for the primary, the spec's for a
+        // secondary. A device that declares one length then serves another
+        // does not enumerate, so a mismatch is refused at create time.
+        int declaredPrimaryLen = hidClass[7] | (hidClass[8] << 8);
+        if (declaredPrimaryLen != ReportDescriptor.Length)
+            throw new InvalidOperationException(
+                $"HID class descriptor declares a {declaredPrimaryLen}-byte report descriptor " +
+                $"but the profile's is {ReportDescriptor.Length} bytes.");
+        foreach (var kv in classByIface)
+        {
+            if (kv.Key == hidIface) continue;
+            if (!declaredReports.TryGetValue(kv.Key, out var rd))
+                throw new InvalidOperationException(
+                    $"Interface {kv.Key} is a HID interface but the profile declares no " +
+                    $"usbConfiguration reportDescriptor for it.");
+            int declared = kv.Value[7] | (kv.Value[8] << 8);
+            if (declared != rd.Length)
+                throw new InvalidOperationException(
+                    $"Interface {kv.Key}'s HID class descriptor declares a {declared}-byte report " +
+                    $"descriptor but the profile's is {rd.Length} bytes.");
+            _secondaryHid[kv.Key] = (kv.Value, rd);
+        }
         _hidClassDescriptor = hidClass;
         HidInterfaceNumber = hidIface;
 
@@ -179,6 +271,7 @@ internal sealed class UsbDescriptorSet
                     bool typeOk = ep.TransferType switch
                     {
                         "isochronous" => found.TransferType == 1,
+                        "bulk" => found.TransferType == 2,
                         "interrupt" => found.TransferType == 3,
                         _ => false,
                     };
@@ -217,18 +310,35 @@ internal sealed class UsbDescriptorSet
         }
     }
 
-    /// <summary>HID-class GET_DESCRIPTOR on the HID interface: 0x22 is the
-    /// report descriptor, 0x21 the HID class descriptor.</summary>
-    public byte[]? GetHidDescriptor(byte type)
-        => type switch { 0x22 => ReportDescriptor, 0x21 => _hidClassDescriptor, _ => null };
+    /// <summary>HID-class GET_DESCRIPTOR on a HID interface: 0x22 is the
+    /// report descriptor, 0x21 the HID class descriptor. Answered per
+    /// interface, so a composite presenting several HID interfaces serves
+    /// each its own (issue #56).</summary>
+    public byte[]? GetHidDescriptor(byte type, byte interfaceNumber)
+    {
+        if (interfaceNumber != HidInterfaceNumber
+            && _secondaryHid.TryGetValue(interfaceNumber, out var sec))
+            return type switch { 0x22 => sec.ReportDescriptor, 0x21 => sec.ClassDescriptor, _ => null };
+        return type switch { 0x22 => ReportDescriptor, 0x21 => _hidClassDescriptor, _ => null };
+    }
+
+    /// <summary>True when the interface number is a HID interface this
+    /// device presents, primary or secondary.</summary>
+    public bool IsHidInterface(byte interfaceNumber)
+        => interfaceNumber == HidInterfaceNumber || _secondaryHid.ContainsKey(interfaceNumber);
 
     private byte[]? GetStringDescriptor(byte index)
     {
         if (index == 0)
             return new byte[] { 0x04, 0x03, 0x09, 0x04 }; // one LANGID: en-US
+        // A device that declares a string index has to serve it. Sony's pads
+        // declare iSerial 0 and get null below, unchanged; Valve's declare a
+        // real serial at index 3 and a configuration name at 4, and Steam
+        // logs the serial it reads here (issue #56).
         string? s = index == _iManufacturer && _iManufacturer != 0 ? _manufacturer
                   : index == _iProduct && _iProduct != 0 ? _product
-                  : index == _iSerial && _iSerial != 0 ? null // real pad has no serial string
+                  : index == _iSerial && _iSerial != 0 ? _serial
+                  : index == _iConfiguration && _iConfiguration != 0 ? _configurationName
                   : null;
         if (s == null) return null;
         var bytes = Encoding.Unicode.GetBytes(s);

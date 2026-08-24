@@ -149,6 +149,15 @@ public sealed class HMController : IDisposable
     // the handshake still see legacy Report 1 emission.
     private volatile bool _extendedModeArmed;
 
+    // Idle streaming (issue #56). A device that only writes on change is
+    // invisible to any consumer that probes it before touching it, and
+    // Valve's drivers do exactly that. These hold the last state so the
+    // pump can re-publish it at the profile's declared cadence.
+    private HMGamepadState _lastSubmitted;
+    private long _lastSubmitTicks;
+    private Thread? _idleThread;
+    private readonly CancellationTokenSource _idleCts = new();
+
     // Switch Pro protocol (issue #33): wire-format packer state. See
     // SwitchProPacker + the driver-side responder in driver.c.
     private bool _switchProtocol;
@@ -410,6 +419,21 @@ public sealed class HMController : IDisposable
         // Output passthrough is best-effort. If the section can't be created
         // (rare — only LocalService permission issues) we just don't raise
         // OutputReceived events.
+        int idleMs = profile.ExtendedReport?.IdleFrameIntervalMs ?? 0;
+        if (idleMs > 0)
+        {
+            // Publish one frame immediately so the device is already
+            // streaming when a driver opens it, then keep the cadence up
+            // whenever the consumer goes quiet.
+            _lastSubmitted = new HMGamepadState();
+            _idleThread = new Thread(() => IdleFrameLoop(idleMs))
+            {
+                IsBackground = true,
+                Name = $"HMIdleFrames_{index}",
+            };
+            _idleThread.Start();
+        }
+
         try
         {
             _outputView = SharedMemoryIO.EnsureOutputMapping(index);
@@ -479,6 +503,11 @@ public sealed class HMController : IDisposable
                 return Math.Clamp(vCanon, 0f, 1f);
             if (slot < triggers.Count && axes.TryGetValue(triggers[slot].Axis, out var vField))
                 return Math.Clamp(vField, 0f, 1f);
+            // Opaque vendor descriptor: no declared triggers to look up, so
+            // accept the canonical Z / Rz the helper writes in that case.
+            if (triggers.Count == 0
+                && axes.TryGetValue(slot == 0 ? HMAxis.Z : HMAxis.Rz, out var vCanon2))
+                return Math.Clamp(vCanon2, 0f, 1f);
         }
         return 0.0;
     }
@@ -489,6 +518,14 @@ public sealed class HMController : IDisposable
     public void SubmitState(in HMGamepadState state)
     {
         ThrowIfDisposed();
+
+        // Remembered for the idle pump, and the timestamp is what
+        // keeps the pump from competing with a live consumer.
+        if (_idleThread != null)
+        {
+            _lastSubmitted = state;
+            Interlocked.Exchange(ref _lastSubmitTicks, Environment.TickCount64);
+        }
 
         long startTicks = OnSubmitLatencyMicros != null
             ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -510,10 +547,22 @@ public sealed class HMController : IDisposable
         // immutable for the controller's lifetime, so resolve once.
         var sticks = _cachedSticks;
         var triggers = _cachedTriggers;
-        double mlx = sticks.Count > 0 ? GetAxis(sticks[0].XAxis, 0.5) : 0.5;
-        double mly = sticks.Count > 0 ? GetAxis(sticks[0].YAxis, 0.5) : 0.5;
-        double mrx = sticks.Count > 1 ? GetAxis(sticks[1].XAxis, 0.5) : 0.5;
-        double mry = sticks.Count > 1 ? GetAxis(sticks[1].YAxis, 0.5) : 0.5;
+        // Sticks resolve canonical-first when the descriptor declares none,
+        // mirroring ResolveTrigger below (issue #56). Profile.Sticks derives
+        // from the descriptor-built report builder, so a profile whose
+        // descriptor is an opaque vendor blob - every Valve state packet -
+        // has no declared sticks at all. Hard-defaulting those to 0.5 put a
+        // live device on the wire whose sticks never left centre, while its
+        // triggers worked, because only triggers had a fallback. The right
+        // stick accepts either convention: Rx/Ry, or Sony's Z/Rz.
+        double mlx = sticks.Count > 0 ? GetAxis(sticks[0].XAxis, 0.5) : GetAxis(HMAxis.X, 0.5);
+        double mly = sticks.Count > 0 ? GetAxis(sticks[0].YAxis, 0.5) : GetAxis(HMAxis.Y, 0.5);
+        double mrx = sticks.Count > 1 ? GetAxis(sticks[1].XAxis, 0.5)
+                   : axes != null && axes.ContainsKey(HMAxis.Rx) ? GetAxis(HMAxis.Rx, 0.5)
+                                                                 : GetAxis(HMAxis.Z, 0.5);
+        double mry = sticks.Count > 1 ? GetAxis(sticks[1].YAxis, 0.5)
+                   : axes != null && axes.ContainsKey(HMAxis.Ry) ? GetAxis(HMAxis.Ry, 0.5)
+                                                                 : GetAxis(HMAxis.Rz, 0.5);
         // Triggers resolve canonical-first, then fall back to the descriptor's
         // declared trigger field. PadForge writes axes[Z]/axes[Rz] via
         // ResolveAxisByRole (canonical defaults when no axisMap); HIDMaestroTest
@@ -846,6 +895,38 @@ public sealed class HMController : IDisposable
     /// cost instead of up-to-8-ms poll quantization; the drain-to-Head
     /// loop below is unchanged, so burst coalescing behaves identically
     /// in both modes.</summary>
+    /// <summary>Re-publish the last state at the profile's declared
+    /// interval whenever the consumer has gone quiet for longer than that.
+    /// The encoder runs again for each repeat rather than the bytes being
+    /// copied, so rolling counters advance the way a real device's do -
+    /// SDL_hidapi_steam.c treats a repeated unPacketNum as no new data at
+    /// all.</summary>
+    private void IdleFrameLoop(int intervalMs)
+    {
+        var token = _idleCts.Token;
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                long quiet = Environment.TickCount64 - Interlocked.Read(ref _lastSubmitTicks);
+                if (quiet >= intervalMs)
+                {
+                    var st = _lastSubmitted;
+                    SubmitState(in st);
+                    // SubmitState stamps _lastSubmitTicks, so a live
+                    // consumer's own cadence always wins over this one.
+                }
+            }
+            catch
+            {
+                // Same containment contract as OutputPollLoop: a transient
+                // failure must not kill the pump, and disposal races here
+                // are ordinary rather than exceptional.
+            }
+            if (token.WaitHandle.WaitOne(intervalMs)) break;
+        }
+    }
+
     private void OutputPollLoop()
     {
         if (_outputView == IntPtr.Zero) return;
@@ -1087,6 +1168,10 @@ public sealed class HMController : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        // Idle frames stop before the output pump, so no repeat can
+        // land on a section this Dispose is about to unmap.
+        try { _idleCts.Cancel(); } catch { }
+        try { _idleThread?.Join(Internal.TimeoutScale.Apply(500)); } catch { }
         try { _outputCts.Cancel(); } catch { }
         try { _outputThread?.Join(Internal.TimeoutScale.Apply(500)); } catch { }
         // Drop the registration before the CTS is disposed, so a concurrent

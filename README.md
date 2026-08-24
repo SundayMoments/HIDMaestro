@@ -25,11 +25,11 @@
 
 **Virtual game controllers that look like real hardware to Windows. No kernel driver. No network. No reboot.**
 
-HIDMaestro creates virtual controllers that present the exact identity of real hardware across the whole Windows input stack at once. Pick from 228 built-in profiles or point it at a controller you own and clone it. DirectInput, XInput, SDL3, the browser Gamepad API, and WGI/GameInput all see the VID/PID, product name, HID descriptor, axis and button layout, and bus type the profile defines.
+HIDMaestro creates virtual controllers that present the exact identity of real hardware across the whole Windows input stack at once. Pick from 234 built-in profiles or point it at a controller you own and clone it. DirectInput, XInput, SDL3, the browser Gamepad API, and WGI/GameInput all see the VID/PID, product name, HID descriptor, axis and button layout, and bus type the profile defines.
 
 It runs entirely in user mode (UMDF2), signed with a locally trusted self-signed certificate. No EV certificate, no `testsigning` boot mode, no kernel driver that can blue-screen the machine.
 
-<p align="center"><b>228</b> device profiles · <b>32</b> vendors · <b>~35 µs</b> median single-press · <b>0</b> kernel drivers</p>
+<p align="center"><b>234</b> device profiles · <b>32</b> vendors · <b>~35 µs</b> median single-press · <b>0</b> kernel drivers</p>
 
 ```csharp
 using var ctx = new HMContext();
@@ -60,7 +60,7 @@ bin\Release\net10.0-windows10.0.26100.0\win-x64\HIDMaestroTest.exe emulate xbox-
 # Several controllers at once, any mix of profiles
 HIDMaestroTest.exe emulate xbox-series-xs-bt xbox-360-wired dualsense
 
-# List or search the 228 profiles
+# List or search the 234 profiles
 HIDMaestroTest.exe list
 HIDMaestroTest.exe search thrustmaster
 
@@ -231,6 +231,32 @@ Every device behavior stays in HIDMaestro's own user-mode code: the SDK runs an 
 
 Measured on the Atom Z8350 floor machine: full 4-channel render and live microphone capture through `usbaudio.sys` with no frame starvation, attach in ~316 ms, and idle cost with the transport installed but no device attached indistinguishable from baseline (0.35% vs 0.24% CPU). The composite path runs as scenario S45 of the battery, so a broken persona fails the release gate like anything else.
 
+### Valve-recognized Steam devices
+
+The same machinery answers a different problem. The plain `steam-deck` and `steam-controller` profiles carry Valve's real ids over standard gamepad descriptors, so Steam files them under Generic DirectInput and none of Steam Input's Valve-device treatment applies: no gyro lane, no trackpads, no HD haptics, no Valve button prompts. Recognition follows the device a real unit presents, not the ids alone. Three personas present those devices.
+
+`steam-deck-composite` (28DE:1205) reproduces a real unit's whole USB identity from its `lsusb` dump, because that identity is what Steam inspects: `bcdDevice` 3.00, product string `Steam Controller`, a serial string, `wTotalLength` 150 and five interfaces: mouse on 0, keyboard on 1, the vendor-page controller on 2, then an Interface Association Descriptor and the CDC ACM pair on 3 and 4. Input is the 64-byte Neptune frame (`ID_CONTROLLER_DECK_STATE`, header `01 00 09 40`), packed from `SteamDeckStatePacket_t` and cross-checked against a 25,000-frame capture of real hardware.
+
+`steam-controller-composite` (28DE:1102) is the wired 2015 controller. Every descriptor is verbatim from a real unit: the device and configuration blobs, the 63-byte keyboard and 56-byte mouse report descriptors its lizard mode drives, and the 33-byte vendor-page controller descriptor. Three interfaces, because SDL binds the pad only on interface 2. Its frame is `ValveControllerStatePacket_t`; the pad has one stick and no separate stick field, so with the finger-down bit clear `sLeftPadX/Y` is the joystick, which is how the hardware reports it.
+
+`steam-controller-2` (28DE:1302) is the 2026 controller, the one SDL calls Triton. One HID interface addressing everything by report id, with the 372-byte descriptor and the attribute values Steam validates taken from two independent reads of real hardware. Its frame is the 54-byte `TritonMTUFull_t` on report `0x42`.
+
+All three answer the `GET_REPORT` interrogation Steam performs before it will claim a device, and all three are verified end to end by battery scenarios S51 and S52: S51 pins descriptors, endpoints and feature answers with no device; S52 creates each persona, drives it through `SubmitState`, and reads the frame back off the real HID stack to confirm input reaches a consumer.
+
+## Virtual VR controllers
+
+A VR controller is not an OS device: games ask the VR runtime "where is the left hand, and what is its trigger doing." So this subsystem is a native OpenVR driver that SteamVR's own vrserver loads, embedded in `HIDMaestro.Core.dll` and registered with one call. One driver covers native OpenVR games and OpenXR games running on SteamVR, which is the default PCVR configuration.
+
+```csharp
+HMVR.EnsureDriverRegistered();          // one-time, content-hash idempotent
+using var vr = new HMVRController();    // both hands appear in SteamVR
+vr.SubmitState(in state);               // buttons, trigger/grip, stick, optional full pose - per frame
+vr.HapticReceived += (_, e) => ...;     // every haptic pulse a VR app plays, with hand attribution
+var head = vr.GetHmdPose();             // the real headset pose, for head-as-input mapping
+```
+
+The hands hold real SteamVR hand roles, serve the modern input system through a full input profile, and serve legacy `GetControllerState` readers through a shipped legacy binding. Controllers exist only while a consumer is live, so an idle machine shows no phantom devices. SteamVR is the one dependency, and it installs Steam-client-free and account-free via Valve's own `steamcmd +login anonymous +app_update 250820`. The whole loop is machine-verified on headless rigs with no headset (battery scenario S50): enumeration, roles, input, haptics, and a 90 Hz legacy state stream read back through Valve's own client API. [Full docs](https://hidmaestro.org/docs/sdk/vr-controllers/).
+
 ---
 
 ## How it compares
@@ -244,7 +270,7 @@ Measured on the Atom Z8350 floor machine: full 4-channel render and live microph
 | Installs without test-signing mode | **Yes** | Yes | Yes | Yes | No (ships test-signed) |
 | EV certificate for new builds | **No** | No (uses signed usbip-win2) | Yes ($300+/yr) | Yes | No (OV cert for x64) |
 | Network play | **App layer via consumers (PadForge Remote Link), zero local penalty** | In the driver: +1-5 ms wired, +10-50 ms Wi-Fi | No | No | No |
-| Identity per controller | **Exact, 228 profiles** | 6 fixed device types | 2 fixed types | Fixed "vJoy Device" | 4 presets, or raw descriptor |
+| Identity per controller | **Exact, 234 profiles** | 6 fixed device types | 2 fixed types | Fixed "vJoy Device" | 4 presets, or raw descriptor |
 | Bus type fidelity | **Per-profile, incl. Bluetooth** | USB only (USBIP) | USB only | USB only | USB only |
 | Add a new device | **JSON file, or capture one you own** | Write Go (a few hundred lines/device) | N/A | N/A | Write C, or raw descriptor |
 | Local single-press latency | **~35 µs measured** | 168 µs published (localhost) | N/A | N/A | Not published |

@@ -31,6 +31,16 @@ internal sealed class VendorBlobProgram
         I16, U32, TouchpadFinger, Bitfield, Battery, HatOctant,
         ButtonMask, Rgb24, BytesPassthrough, BytesZero, Crc32,
         Stick12Pair,
+        // Valve's 16-bit state packets (issue #56). The Steam Deck and both
+        // Steam Controllers carry sticks as signed 16-bit, triggers as
+        // unsigned 16-bit, and a 32-bit packet counter, none of which the
+        // 8-bit ops above can express.
+        I16Axis, U16Trigger, U32Rolling,
+        // Valve's trackpads. Each pad is a signed 16-bit coordinate
+        // pair plus an unsigned pressure, and on the 2015 controller
+        // the left pair is shared with the joystick, which is why the
+        // pad-or-stick op exists rather than two independent fields.
+        I16Pad, I16PadOrStick, U16Pressure,
     }
 
     /// <summary>Input-direction value source, numeric. Replaces the
@@ -47,6 +57,12 @@ internal sealed class VendorBlobProgram
         // an X/Y pair, because the wire format interleaves the two axes
         // inside shared bytes and neither can be written alone.
         LeftStick, RightStick,
+        // Trackpad coordinates and pressures. Finger 0 drives the left
+        // pad and finger 1 the right, because a Valve pad is a
+        // single-contact surface and the two pads are separate
+        // surfaces, unlike Sony's one two-finger pad.
+        LeftPadX, LeftPadY, RightPadX, RightPadY,
+        LeftPadPressure, RightPadPressure,
     }
 
     // Bitfield flag sources (input direction), numeric. Index-aligned with
@@ -66,6 +82,12 @@ internal sealed class VendorBlobProgram
     public const ulong ButtonDpadDown  = 1UL << 35;
     public const ulong ButtonDpadLeft  = 1UL << 36;
     public const ulong ButtonDpadRight = 1UL << 37;
+    // Pad-touch bits, sourced from TouchpadFinger0/1Active rather than
+    // from the button mask. Valve's decoders gate the whole trackpad
+    // lane on these, and on the 2015 controller the left one also
+    // selects whether the shared axes read as pad or as joystick.
+    public const ulong ButtonPad0Touch = 1UL << 38;
+    public const ulong ButtonPad1Touch = 1UL << 39;
 
     public readonly struct CompiledField
     {
@@ -136,7 +158,13 @@ internal sealed class VendorBlobProgram
                 "uint8-rolling"     => FieldOp.U8Rolling,
                 "uint8"             => FieldOp.U8Const,
                 "int16-le"          => FieldOp.I16,
+                "int16-axis"        => FieldOp.I16Axis,
+                "int16-pad"         => FieldOp.I16Pad,
+                "int16-pad-or-stick"=> FieldOp.I16PadOrStick,
+                "uint16-pressure"   => FieldOp.U16Pressure,
+                "uint16-trigger"    => FieldOp.U16Trigger,
                 "uint32-le"         => FieldOp.U32,
+                "uint32-rolling"    => FieldOp.U32Rolling,
                 "touchpad-finger"   => FieldOp.TouchpadFinger,
                 "bitfield"          => FieldOp.Bitfield,
                 "uint8-battery"     => FieldOp.Battery,
@@ -173,6 +201,12 @@ internal sealed class VendorBlobProgram
                 "touchpadFinger0" => SrcOp.Finger0,
                 "leftStick"       => SrcOp.LeftStick,
                 "rightStick"      => SrcOp.RightStick,
+                "leftPadX"        => SrcOp.LeftPadX,
+                "leftPadY"        => SrcOp.LeftPadY,
+                "rightPadX"       => SrcOp.RightPadX,
+                "rightPadY"       => SrcOp.RightPadY,
+                "leftPadPressure" => SrcOp.LeftPadPressure,
+                "rightPadPressure"=> SrcOp.RightPadPressure,
                 _                 => SrcOp.None,
             };
             // touchpad-finger defaults to finger0 for ANY other semantic,
@@ -227,6 +261,8 @@ internal sealed class VendorBlobProgram
                         if (name == "DPAD_DOWN")  { buttonBits[j] = ButtonDpadDown;  continue; }
                         if (name == "DPAD_LEFT")  { buttonBits[j] = ButtonDpadLeft;  continue; }
                         if (name == "DPAD_RIGHT") { buttonBits[j] = ButtonDpadRight; continue; }
+                        if (name == "LEFTPAD_TOUCH")  { buttonBits[j] = ButtonPad0Touch; continue; }
+                        if (name == "RIGHTPAD_TOUCH") { buttonBits[j] = ButtonPad1Touch; continue; }
                         if (Enum.TryParse<HMButton>(name, true, out var btn))
                             buttonBits[j] = (uint)btn;
                     }

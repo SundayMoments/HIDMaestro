@@ -162,6 +162,11 @@ if ($verMatch.Success) {
         Join-Path $scriptDir '..\probes\switch2_pro_sdl3_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
         Join-Path $scriptDir '..\probes\sony_extra_buttons_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
         Join-Path $scriptDir '..\probes\vr_controller_smoke\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\valve_persona_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\valve_wire_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\valve_sdl_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\valve_steam_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\valve_multi_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
     )
     # Canonical SDK output for the content-hash check. Source tree only:
     # a release bundle carries no sdk/ build output, and the version
@@ -1497,15 +1502,18 @@ function Scenario-Switch2-Pro {
 # DS4Windows, ds5-edge-relay and dualsense-tester agree on, plus the
 # sentinel that stopped HMButton.Share aliasing onto PS. Offline, no
 # device.
-# S50: the virtual VR controller subsystem (issue #32). Phase 1 always
-# runs and pins the C# and C++ halves of the HIDMaestroVR IPC protocol
-# to each other byte-for-byte, with the probe playing the driver's role.
-# Phase 2 runs when a SteamVR install is present (the devbox carries a
-# Steam-free steamcmd install at C:\SteamVR): registers the embedded
-# OpenVR driver, boots the headless null-HMD stack, and asserts both
-# virtual controllers enumerate through Valve's own client API plus a
-# full haptic round trip. On machines without SteamVR (the Atom) phase 2
-# self-reports as skipped WITH the reason printed; phase 1 still gates.
+# S50: the virtual VR controller subsystem (issues #32, #51, #55).
+# Phase 1 always runs and pins the C# and C++ halves of the HIDMaestroVR
+# IPC protocol to each other byte-for-byte, with the probe playing the
+# driver's role. Phase 2 runs when a SteamVR install is present (BOTH
+# battery machines carry the Steam-free steamcmd install at C:\SteamVR,
+# with the headless null-HMD rig config): registers the embedded OpenVR
+# driver, boots the stack, and asserts controller enumeration, hand
+# roles, legacy axis types, the haptic round trip, the consumer-restart
+# cycle, and the #55 legacy GetControllerState lane via a spawned
+# scene-app reader. A [SKIP] of phase 2 on a battery machine is a rig
+# fault, not a pass: both machines are provisioned with SteamVR, so the
+# skip reason must be read, the rig repaired, and the scenario re-run.
 function Scenario-Vr-Controller-Smoke {
     $probe = Resolve-ProbeBinary 'vr_controller_smoke' 'VrControllerSmoke.exe'
     $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
@@ -1527,6 +1535,97 @@ function Scenario-Switch2-Pro-Sdl3 {
     $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
     if ($p.ExitCode -ne 0) {
         throw ("Switch2ProSdl3Check exited " + $p.ExitCode + " - SDL no longer sees the Switch 2 Pro as a full gamepad: either it stopped reaching the joystick layer, an input stopped arriving, or the profile's sdlMapping drifted from its descriptor's button and axis order (see probe stdout)")
+    }
+}
+
+# S51: the three Valve composite personas (issue #56, from PadForge
+# discussion #337) - the Steam Deck, the 2015 Steam Controller and the
+# 2026 one SDL calls Triton. Pins their wire truth with no device and no
+# elevation: the multi-HID-interface descriptor sets (each controller
+# interface plus the keyboard and mouse its lizard mode drives), endpoint
+# addresses and intervals against the real units' lsusb dumps, the report
+# ids Triton's single interface carries, and the feature-stub tables that
+# answer Steam's GET_REPORT interrogation.
+function Scenario-Valve-Personas {
+    $probe = Resolve-ProbeBinary 'valve_persona_check' 'ValvePersonaCheck.exe'
+    $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
+    if ($p.ExitCode -ne 0) {
+        throw ("ValvePersonaCheck exited " + $p.ExitCode + " - a Valve persona drifted: a descriptor set, an endpoint, a declared report id, the feature-stub answers Steam reads, or the 64-byte Neptune input frame (see probe stdout)")
+    }
+}
+
+# S52: the three Valve personas on the wire. Each is created for real,
+# driven through SubmitState - the same call any consumer makes - and the
+# frame is read back off the HID stack and checked against that device's
+# own wire format (SteamDeckStatePacket_t, ValveControllerStatePacket_t,
+# TritonMTUFull_t). S51 pins the descriptors and feature answers with no
+# device; this pins that input actually reaches a consumer, which is the
+# half that shipped broken. Submits no buttons, so nothing reaches the
+# desktop even with a Steam desktop layout bound to the device.
+function Scenario-Valve-Wire {
+    $probe = Resolve-ProbeBinary 'valve_wire_check' 'ValveWireCheck.exe'
+    $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
+    if ($p.ExitCode -ne 0) {
+        throw ("ValveWireCheck exited " + $p.ExitCode + " - a Valve persona stopped emitting correct input frames (see probe stdout)")
+    }
+}
+
+# S53: the three Valve personas through STOCK upstream SDL3. S52 decodes
+# each frame with arithmetic copied out of SDL's drivers; this one hands the
+# device to a real SDL3.dll built from libsdl-org/SDL and asks SDL what it
+# sees. Those Steam drivers are the decoders Steam Input is built on, so a
+# persona SDL binds, names and reads is one a Valve-aware consumer reads.
+# SKIPs when the sibling SDL3-build/build-stock checkout is absent; the fork
+# beside it deliberately skips HIDMaestro devices and is never used here.
+function Scenario-Valve-Sdl {
+    $probe = Resolve-ProbeBinary 'valve_sdl_check' 'ValveSdlCheck.exe'
+    $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
+    if ($p.ExitCode -eq 2) {
+        Write-Host '    [SKIP] no stock SDL3 build beside the repo' -ForegroundColor Yellow
+        return
+    }
+    if ($p.ExitCode -ne 0) {
+        throw ("ValveSdlCheck exited " + $p.ExitCode + " - stock SDL stopped reading a Valve persona: enumeration, the Valve driver binding, sticks, triggers, trackpads or motion (see probe stdout)")
+    }
+}
+
+# S54: the three Valve personas against the REAL Steam client. S53 proves
+# SDL's Steam drivers read them, and those drivers are what Steam Input is
+# built on, but that is an argument rather than a measurement. This one
+# measures it: each persona is handed to a running Steam client and Steam's
+# own controller log is read back for the claim, the protocol it picked and
+# the per-model config set it loaded (neptune, steamcontroller_gordon,
+# triton), plus the absence of the hid_read-failure close an idle device
+# used to produce. Starts Steam with -silent and shuts it back down when it
+# started it. Submits nothing, so nothing can reach the desktop through a
+# Steam desktop layout. SKIPs when no Steam client is installed.
+function Scenario-Valve-Steam {
+    $probe = Resolve-ProbeBinary 'valve_steam_check' 'ValveSteamCheck.exe'
+    $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
+    if ($p.ExitCode -eq 2) {
+        Write-Host '    [SKIP] no Steam client on this machine' -ForegroundColor Yellow
+        return
+    }
+    if ($p.ExitCode -ne 0) {
+        throw ("ValveSteamCheck exited " + $p.ExitCode + " - Steam stopped claiming a Valve persona, stopped classifying it as that model, or dropped it after opening it (see probe stdout)")
+    }
+}
+
+# S55: several Valve personas at once. S51-S54 each drive one device, so
+# neither the three-different case nor the two-of-the-same case is covered
+# by them. The second is the one that was broken: the Deck's serial comes
+# from a real unit and Steam keys per-controller config off it, so a pair
+# of Decks reporting one serial shared one configuration. Verified through
+# stock SDL. SKIPs without a stock SDL3 build beside the repo.
+function Scenario-Valve-Multi {
+    $probe = Resolve-ProbeBinary 'valve_multi_check' 'ValveMultiCheck.exe'
+    $p = Start-Process -FilePath $probe -PassThru -NoNewWindow -Wait
+    if ($p.ExitCode -eq 2) {
+        Write-Host '    [SKIP] no stock SDL3 build beside the repo' -ForegroundColor Yellow
+        return
+    }
+    if ($p.ExitCode -ne 0) {
+        throw ("ValveMultiCheck exited " + $p.ExitCode + " - Valve personas stopped coexisting: three models at once, two of one model, or the per-instance serial collapsed back to one value (see probe stdout)")
     }
 }
 
@@ -1596,7 +1695,12 @@ $scenarios = @(
     @{ Name = 'S47_Switch2_Pro_Profile';          Body = ${function:Scenario-Switch2-Pro} },
     @{ Name = 'S48_Switch2_Pro_Sdl3';             Body = ${function:Scenario-Switch2-Pro-Sdl3} },
     @{ Name = 'S49_Sony_Extra_Buttons';           Body = ${function:Scenario-Sony-Extra-Buttons} },
-    @{ Name = 'S50_Vr_Controller_Smoke';          Body = ${function:Scenario-Vr-Controller-Smoke} }
+    @{ Name = 'S50_Vr_Controller_Smoke';          Body = ${function:Scenario-Vr-Controller-Smoke} },
+    @{ Name = 'S51_Valve_Personas';               Body = ${function:Scenario-Valve-Personas} },
+    @{ Name = 'S52_Valve_Wire';                   Body = ${function:Scenario-Valve-Wire} },
+    @{ Name = 'S53_Valve_Sdl';                    Body = ${function:Scenario-Valve-Sdl} },
+    @{ Name = 'S54_Valve_Steam';                  Body = ${function:Scenario-Valve-Steam} },
+    @{ Name = 'S55_Valve_Multi';                  Body = ${function:Scenario-Valve-Multi} }
 )
 
 $totalSw = [System.Diagnostics.Stopwatch]::StartNew()

@@ -28,6 +28,16 @@ public sealed class ControllerProfile
     [JsonPropertyName("pid")]
     public string Pid { get; set; } = "";
 
+    /// <summary>USB iSerialNumber string, when the device declares one.
+    /// Valve's pads do; Sony's do not. Steam reads and logs it.</summary>
+    [JsonPropertyName("serialString")]
+    public string? SerialString { get; set; }
+
+    /// <summary>USB iConfiguration string, when the configuration
+    /// descriptor names one (the Deck calls its "Full-Speed").</summary>
+    [JsonPropertyName("configurationString")]
+    public string? ConfigurationString { get; set; }
+
     [JsonPropertyName("productString")]
     public string ProductString { get; set; } = "";
 
@@ -197,6 +207,13 @@ public sealed class ControllerProfile
     /// and only the HID report descriptor is ours to author.</summary>
     [JsonPropertyName("usbConfiguration")]
     public UsbConfigurationSpec? UsbConfiguration { get; set; }
+
+    /// <summary>Issue #56. Feature-report answers this persona serves, for
+    /// a device whose claiming software interrogates it over
+    /// GET_REPORT(Feature). Only meaningful on the <c>usbip</c> backend;
+    /// see <see cref="Usbip.FeatureStubTable"/> for the keying rules.</summary>
+    [JsonPropertyName("featureStubs")]
+    public FeatureStubSpec? FeatureStubs { get; set; }
 
     /// <summary>True when this profile is a composite USB persona and
     /// therefore takes the USB/IP create path rather than the UMDF2
@@ -396,6 +413,20 @@ public sealed class ExtendedReportSpec
     [JsonPropertyName("alwaysArmed")]
     public bool AlwaysArmed { get; set; }
 
+    /// <summary>Frame interval, in milliseconds, at which this device keeps
+    /// streaming while the consumer is quiet. 0 leaves the device
+    /// event-driven, which is the default and what every profile before
+    /// issue #56 wanted.
+    ///
+    /// Valve's own drivers require a stream. SDL_hidapi_steamdeck.c's
+    /// InitDevice reads with a 16 ms timeout to work out which of the three
+    /// same-VID/PID HID interfaces is the controller, and returns false when
+    /// that read comes back empty, so an idle persona is rejected before it
+    /// ever reaches the joystick layer. Real hardware streams at about
+    /// 4 ms whether or not anything is moving.</summary>
+    [JsonPropertyName("idleFrameIntervalMs")]
+    public int IdleFrameIntervalMs { get; set; }
+
     /// <summary>Ordered field descriptors. See VendorBlobCodec for the type
     /// vocabulary.</summary>
     [JsonPropertyName("fields")]
@@ -404,6 +435,73 @@ public sealed class ExtendedReportSpec
     [JsonIgnore]
     public byte ReportIdByte => string.IsNullOrEmpty(ReportId) ? (byte)0
         : Convert.ToByte(ReportId.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? ReportId.Substring(2) : ReportId, 16);
+}
+
+/// <summary>Issue #56. A persona's feature-report answer table.</summary>
+public sealed class FeatureStubSpec
+{
+    /// <summary>How a request selects an entry: <c>"reportId"</c> (the
+    /// default) keys on the request's own report id, <c>"lastMessage"</c>
+    /// on the message id of the SET_REPORT that preceded it, for protocols
+    /// that declare no report ids.</summary>
+    [JsonPropertyName("match")]
+    public string Match { get; set; } = "reportId";
+
+    /// <summary>Which byte of a SET_REPORT(Feature) payload carries the
+    /// message id, under <c>match: "lastMessage"</c>. Zero when the
+    /// descriptor declares no report ids and the payload is the message
+    /// outright (Valve's Steam Deck and 2015 Steam Controller); one when a
+    /// report id precedes it (the 2026 Steam Controller, whose command
+    /// channel rides feature report 1).</summary>
+    [JsonPropertyName("messageByte")]
+    public int MessageByte { get; set; }
+
+    [JsonPropertyName("reports")]
+    public List<FeatureStubReport> Reports { get; set; } = new();
+}
+
+/// <summary>One feature-report answer.</summary>
+public sealed class FeatureStubReport
+{
+    /// <summary>Report id, or message id under <c>match: "lastMessage"</c>.
+    /// Hex.</summary>
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+
+    [JsonIgnore]
+    public byte IdByte => string.IsNullOrEmpty(Id) ? (byte)0
+        : Convert.ToByte(Id.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? Id.Substring(2) : Id, 16);
+
+    /// <summary>The report's wire length. The device pads to it.</summary>
+    [JsonPropertyName("size")]
+    public int Size { get; set; }
+
+    /// <summary>The answer's leading bytes, hex, verbatim from a real
+    /// device's reply. Shorter than <see cref="Size"/> is normal: the tail
+    /// is zeros.</summary>
+    [JsonPropertyName("data")]
+    public string? Data { get; set; }
+
+    /// <summary>The message parameter this answer is for, when one message
+    /// carries several. Valve's ID_GET_STRING_ATTRIBUTE (0xAE) takes a
+    /// string index and answers a different string for each, so a persona
+    /// declares one entry per index. Absent means the entry answers the
+    /// message whatever parameter it carried, which is the right reading
+    /// for a message that takes none.</summary>
+    [JsonPropertyName("param")]
+    public int? Param { get; set; }
+
+    /// <summary>Answer by echoing the message that was written, padded to
+    /// <see cref="Size"/>, rather than with a fixed <see cref="Data"/>.
+    /// Valve's ID_SET_SETTINGS_VALUES (0x87) reads back as the settings
+    /// block the host just wrote, so no constant can serve it. Observed on
+    /// a real Steam Deck answering a real Steam client.</summary>
+    [JsonPropertyName("echo")]
+    public bool Echo { get; set; }
+
+    /// <summary>Why this answer is what it is. Documentation only.</summary>
+    [JsonPropertyName("comment")]
+    public string? Comment { get; set; }
 }
 
 /// <summary>v1.3.5 — fixed-byte overlay applied to the legacy input report
