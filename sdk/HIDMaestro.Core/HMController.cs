@@ -28,6 +28,13 @@ public sealed class HMController : IDisposable
     private readonly HMContext _context;
     internal int Index { get; }
     internal string? InstanceId { get; }
+
+    /// <summary>The identity key this controller was created with. Every
+    /// devnode instance id, the container id and, for USB/IP personas, the
+    /// USB serial derive from it, so creating a controller with the same
+    /// key again brings back the same device paths (issue #60). A caller
+    /// that passed no key sees <c>index:&lt;N&gt;</c> here.</summary>
+    public string IdentityKey { get; }
     public HMProfile Profile { get; }
 
     // Issue #39: non-null when this controller runs on the USB/IP
@@ -350,11 +357,13 @@ public sealed class HMController : IDisposable
     private readonly bool _packsGipBuffer;
 
     internal HMController(HMContext context, int index, HMProfile profile, string? instanceId,
-                          Internal.Usbip.UsbipBackendHandle? usbipHandle = null)
+                          Internal.Usbip.UsbipBackendHandle? usbipHandle = null,
+                          string? identityKey = null)
     {
         _context = context;
         Index = index;
         InstanceId = instanceId;
+        IdentityKey = identityKey ?? Internal.DeviceIdentity.DefaultKey(index);
         Profile = profile;
         UsbipHandle = usbipHandle;
         if (usbipHandle != null)

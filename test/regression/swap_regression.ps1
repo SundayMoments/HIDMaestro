@@ -169,6 +169,8 @@ if ($verMatch.Success) {
         Join-Path $scriptDir '..\probes\xusb_wgi_single_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
         Join-Path $scriptDir '..\probes\valve_steam_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
         Join-Path $scriptDir '..\probes\valve_multi_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\identity_derivation_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
+        Join-Path $scriptDir '..\probes\identity_battery_check\bin\Release\net10.0-windows10.0.26100.0\HIDMaestro.Core.dll'
     )
     # Canonical SDK output for the content-hash check. Source tree only:
     # a release bundle carries no sdk/ build output, and the version
@@ -1618,6 +1620,30 @@ function Scenario-Usbip-E2E-Composite {
                  -Message 'a composite persona failed end to end through the real USB stack (enumeration, HID, audio endpoints, or teardown; see probe stdout)' -SkipCodes 2
 }
 
+# S58: identity derivation (issue #60). No device. The default key
+# reproduces the index-shaped ids, a consumer key derives deterministic
+# and collision-free ids, and the USB serial a persona serves follows
+# the identity: synthesized for the Sony composites, captured and varied
+# for the Valve ones.
+function Scenario-Identity-Derivation {
+    Invoke-Probe -Dir 'identity_derivation_check' -Exe 'IdentityDerivationCheck.exe' `
+                 -Message 'identity derivation changed: a default id, a keyed id, or a persona serial no longer derives as documented (see probe stdout)'
+}
+
+# S59: identity battery (issue #60). One controller per family across
+# nine lives (five same-process cycles, three process restarts, one
+# driver uninstall and reinstall) must keep its parent instance id,
+# ParentIdPrefix, ContainerId, HID children, interface paths, DirectInput
+# GUID, SDL3 path and USB serial. Every life also passes the empty-shell
+# check (Service, interface, input, output, one WGI Gamepad and one XInput
+# slot for the Xbox families). Plus overlap and a profile change at the
+# same key. The reboot life is a manual `--compare` run against the
+# baseline this scenario writes.
+function Scenario-Identity-Battery {
+    Invoke-Probe -Dir 'identity_battery_check' -Exe 'IdentityBatteryCheck.exe' `
+                 -Message 'a virtual controller changed identity across its lives, or came back as an empty shell (see probe stdout)' -SkipCodes 2
+}
+
 # ====================================================================
 #  Runner
 # ====================================================================
@@ -1679,7 +1705,9 @@ $scenarios = @(
     @{ Name = 'S54_Valve_Steam';                  Body = ${function:Scenario-Valve-Steam} },
     @{ Name = 'S55_Valve_Multi';                  Body = ${function:Scenario-Valve-Multi} },
     @{ Name = 'S56_Valve_Raw_Path';               Body = ${function:Scenario-Valve-Raw-Path} },
-    @{ Name = 'S57_Xusb_Wgi_Single';              Body = ${function:Scenario-Xusb-Wgi-Single} }
+    @{ Name = 'S57_Xusb_Wgi_Single';              Body = ${function:Scenario-Xusb-Wgi-Single} },
+    @{ Name = 'S58_Identity_Derivation';         Body = ${function:Scenario-Identity-Derivation} },
+    @{ Name = 'S59_Identity_Battery';            Body = ${function:Scenario-Identity-Battery} }
 )
 
 $totalSw = [System.Diagnostics.Stopwatch]::StartNew()

@@ -32,3 +32,6 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("SonyExtraButtonsCheck")]
 [assembly: InternalsVisibleTo("VrControllerSmoke")]
 [assembly: InternalsVisibleTo("ValveRawPathCheck")]
+[assembly: InternalsVisibleTo("IdentityLab")]
+[assembly: InternalsVisibleTo("IdentityDerivationCheck")]
+[assembly: InternalsVisibleTo("IdentityBatteryCheck")]

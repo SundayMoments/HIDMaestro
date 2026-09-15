@@ -139,7 +139,7 @@ internal static class Program
         Check("an explicit pre-install entry point exists for consumers that want one",
               typeof(HMContext).GetMethod("InstallUsbipBackend") != null);
         Check("no create-path API refuses a composite for lack of an install",
-              typeof(HMContext).GetMethod("CreateController") != null);
+              typeof(HMContext).GetMethod("CreateController", new[] { typeof(HMProfile) }) != null);
 
         Summary();
         return s_failures == 0 ? 0 : 1;

@@ -117,10 +117,10 @@ internal sealed class UsbipEmulatedDevice : IDisposable
         return q;
     }
 
-    public UsbipEmulatedDevice(ControllerProfile profile, int index)
+    public UsbipEmulatedDevice(ControllerProfile profile, int index, DeviceIdentity? identity = null)
     {
         _index = index;
-        Descriptors = new UsbDescriptorSet(profile, index);
+        Descriptors = new UsbDescriptorSet(profile, index, identity);
         _stubs = FeatureStubTable.From(profile);
         _primaryInEndpoint = 0;
         foreach (var kv in Descriptors.Endpoints)

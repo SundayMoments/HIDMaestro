@@ -79,9 +79,11 @@ internal static class DeviceNodeCreator
     ///       setup can start without racing PnP)</item>
     /// </list>
     /// </summary>
-    public static Result CreateDeviceNode(ControllerProfile profile, string infPath, int controllerIndex)
+    public static Result CreateDeviceNode(ControllerProfile profile, string infPath, int controllerIndex,
+                                          DeviceIdentity? identity = null)
     {
         if (profile == null) throw new ArgumentNullException(nameof(profile));
+        identity ??= DeviceIdentity.ForIndex(controllerIndex);
 
         string vid = $"{profile.VendorId:X4}";
         string pid = $"{profile.ProductId:X4}";
@@ -120,6 +122,25 @@ internal static class DeviceNodeCreator
         }
         string hwMulti = $"{hwId}\0root\\HIDMaestro\0\0";
 
+        // Issue #60. The instance id is the identity's, not a number Windows
+        // generates, so this parent has the same name on every life and the
+        // HID child below it can keep its path. A record with that name that
+        // is still around (a prior life's crash residue, or a phantom whose
+        // teardown timed out) is removed first; a record that is not ours
+        // is a hard stop, because claiming it would mutate a foreign device
+        // (issue #28).
+        string instId = $@"ROOT\{enumerator}\{identity.Token}";
+        if (CM_Locate_DevNodeW(out _, instId, 0) == 0 || CM_Locate_DevNodeW(out _, instId, 1) == 0)
+        {
+            if (!DeviceManager.IsHidMaestroOwned(instId))
+            {
+                DeviceOrchestrator.LogDiag($"      {instId} exists and is not HIDMaestro-owned; refusing to claim it");
+                return new Result(false, null);
+            }
+            DeviceOrchestrator.LogDiag($"      {instId} still exists from a prior life; removing before recreate");
+            DeviceManager.RemoveDevice(instId, timeoutMs: 120_000, forceFallbacks: true);
+        }
+
         Guid classGuid = HIDClassGuid;
         IntPtr dis = SetupDiCreateDeviceInfoList(ref classGuid, IntPtr.Zero);
         if (dis == new IntPtr(-1)) return new Result(false, null);
@@ -134,14 +155,32 @@ internal static class DeviceNodeCreator
 
             try
             {
-                if (!SetupDiCreateDeviceInfoW(dis, enumerator, ref classGuid, desc,
-                        IntPtr.Zero, 1 /*DICD_GENERATE_ID*/, devInfoHandle.AddrOfPinnedObject()))
+                // Without DICD_GENERATE_ID the name is the full instance id.
+                if (!SetupDiCreateDeviceInfoW(dis, instId, ref classGuid, desc,
+                        IntPtr.Zero, 0, devInfoHandle.AddrOfPinnedObject()))
+                {
+                    DeviceOrchestrator.LogDiag(
+                        $"      SetupDiCreateDeviceInfoW({instId}) FAILED (Win32={Marshal.GetLastWin32Error()})");
                     return new Result(false, null);
+                }
 
                 byte[] hwBytes = Encoding.Unicode.GetBytes(hwMulti);
                 if (!SetupDiSetDeviceRegistryPropertyW(dis, devInfoHandle.AddrOfPinnedObject(),
                         1 /*SPDRP_HARDWAREID*/, hwBytes, (uint)hwBytes.Length))
                     return new Result(false, null);
+
+                // Issue #60. The HID child's instance id is
+                // <ParentIdPrefix>&<collection>, and PnP reads the prefix
+                // from this parent's instance key when the child first
+                // arrives, minting a new counter value only when the value
+                // is absent. SetupDiCreateDeviceInfoW has created the key
+                // by now (it holds the hardware id just written), so the
+                // identity's prefix goes in before DIF_REGISTERDEVICE and
+                // the child comes back as the same HID\...\1&hash&0&0000
+                // every life. Measured on 26200: three lives with the value
+                // pre-written produced one child path; three without it
+                // counted 0, 1, 2.
+                DeviceIdentity.ApplyParentIdPrefix(instId, identity.ParentIdPrefix, createKey: true);
 
                 // Issue #59. XUSB-companion profiles carry the xinputhid
                 // tripwire on this HID parent so WGI's OnPnpDeviceAdded
@@ -252,49 +291,23 @@ internal static class DeviceNodeCreator
                 devInfoHandle.Free();
             }
 
-            // ── post-creation: assign ControllerIndex + ContainerID ──────────
+            // ── post-creation: assign ControllerIndex ────────────────────────
             //
-            // PnP picks an instance index that may NOT match controllerIndex (ghosts
-            // from previous runs offset numbering). Find OUR newly-created device
-            // by looking for a live device with no ControllerIndex yet. T23-2 —
-            // capture the discovered instance ID so the post-UpdateDriver re-walk
-            // below can skip its scan entirely.
+            // The instance id is ours by construction (issue #60), so the
+            // ControllerIndex the driver reads at start goes straight onto
+            // it. The old walk that hunted for "the live node without a
+            // ControllerIndex" is gone with the generated names that made
+            // it necessary (and that once claimed a coexisting vJoy device,
+            // issue #28).
             string? newlyCreatedInstId = null;
             try
             {
-                using var enumKey = Registry.LocalMachine.OpenSubKey(
-                    $@"SYSTEM\CurrentControlSet\Enum\ROOT\{enumerator}");
-                if (enumKey != null)
+                if (CM_Locate_DevNodeW(out uint _, instId, 0) == 0)
                 {
-                    foreach (var inst in enumKey.GetSubKeyNames())
-                    {
-                        string instId = $@"ROOT\{enumerator}\{inst}";
-                        if (CM_Locate_DevNodeW(out uint _, instId, 0) != 0) continue;
-                        // Issue #28 (v1.3.16): "first node in
-                        // ROOT\<enumerator> without ControllerIndex = the
-                        // one we just created" is fragile — a coexisting
-                        // vJoy device sitting at ROOT\HIDClass\0000 with
-                        // no ControllerIndex matches first and gets its
-                        // Device Parameters mutated, then later renamed
-                        // by SetAllNamingProperties. Require the
-                        // HardwareID multi-sz to contain "HIDMaestro"
-                        // before claiming. SetupDi already wrote that
-                        // value via SetupDiSetDeviceRegistryProperty
-                        // (SPDRP_HARDWAREID) earlier in this method, so
-                        // our newly-created node passes; foreign nodes
-                        // are skipped.
-                        if (!DeviceManager.IsHidMaestroOwned(instId)) continue;
-                        string dpPath = $@"SYSTEM\CurrentControlSet\Enum\{instId}\Device Parameters";
-                        using var dpKey = Registry.LocalMachine.CreateSubKey(dpPath);
-                        var existing = dpKey.GetValue("ControllerIndex");
-                        if (existing == null)
-                        {
-                            dpKey.SetValue("ControllerIndex", controllerIndex, RegistryValueKind.DWord);
-                            newlyCreatedInstId = instId;
-
-                            break;
-                        }
-                    }
+                    string dpPath = $@"SYSTEM\CurrentControlSet\Enum\{instId}\Device Parameters";
+                    using var dpKey = Registry.LocalMachine.CreateSubKey(dpPath);
+                    dpKey.SetValue("ControllerIndex", controllerIndex, RegistryValueKind.DWord);
+                    newlyCreatedInstId = instId;
                 }
             }
             catch { }

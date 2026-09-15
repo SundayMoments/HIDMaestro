@@ -119,8 +119,17 @@ internal sealed class UsbDescriptorSet
         return new string(chars);
     }
 
-    public UsbDescriptorSet(ControllerProfile profile, int index = 0)
+    /// <summary>Build the store for one persona. <paramref name="identity"/>
+    /// supplies the USB serial (issue #60): a profile with a captured serial
+    /// keeps it, varied by <see cref="DeviceIdentity.SerialVariant"/>; a
+    /// profile without one gets <see cref="DeviceIdentity.SyntheticSerial"/>
+    /// and its device descriptor's iSerial is pointed at the next free
+    /// string index, so Windows keys the USB instance id on the serial
+    /// instead of on the vhci port. Null means the index identity, which
+    /// is what every caller before the identity existed got.</summary>
+    public UsbDescriptorSet(ControllerProfile profile, int index = 0, DeviceIdentity? identity = null)
     {
+        identity ??= DeviceIdentity.ForIndex(index);
         var cfg = profile.UsbConfiguration
             ?? throw new InvalidOperationException($"Profile '{profile.Id}' has no usbConfiguration.");
         DeviceDescriptor = FromHex(cfg.DeviceDescriptorHex, "deviceDescriptor");
@@ -141,7 +150,27 @@ internal sealed class UsbDescriptorSet
         _iProduct = DeviceDescriptor[15];
         _iSerial = DeviceDescriptor[16];
         _iConfiguration = ConfigurationDescriptor.Length > 6 ? ConfigurationDescriptor[6] : (byte)0;
-        _serial = InstanceSerial(profile.SerialString, index);
+        if (!string.IsNullOrEmpty(profile.SerialString))
+        {
+            _serial = InstanceSerial(profile.SerialString, identity.SerialVariant);
+        }
+        else
+        {
+            // No captured serial: serve the identity's. The real pad declares
+            // iSerial 0, so the descriptor has to point at a string index for
+            // Windows to read one; take the first index none of the other
+            // strings use. This is the one byte of the captured device
+            // descriptor a persona changes, and it is what makes
+            // USB\VID_054C&PID_0CE6\<serial> the same on every life.
+            _serial = identity.SyntheticSerial;
+            if (_iSerial == 0)
+            {
+                byte next = 1;
+                while (next == _iManufacturer || next == _iProduct || next == _iConfiguration) next++;
+                _iSerial = next;
+                DeviceDescriptor[16] = next;
+            }
+        }
         _configurationName = profile.ConfigurationString;
         _manufacturer = profile.ManufacturerString;
         _product = profile.ProductString;

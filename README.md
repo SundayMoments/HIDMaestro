@@ -90,6 +90,13 @@ VID/PID, product string, descriptor, axis and button layout, and bus type all ma
 - **Data-driven profiles.** Every controller is a JSON file. Adding support for a new one means writing JSON, not modifying code.
 - **Sony pads answer the whole startup interrogation, not just the input reports.** A game with native PlayStation support interrogates a DualSense before it will use it: firmware info, pairing info, then motion calibration. Serve a plausible-looking blob of zeros to any of them and the pad is refused, which is why a virtual controller can work in Steam Input and still be invisible to the game. Calibration is a divisor, so zeros make the consumer's sensitivity NaN. Firmware info is validated on content, and a real title abandons the device and retries every 500 ms on a zeroed reply, before it ever asks for calibration. HIDMaestro serves real payloads for all of them on both the UMDF2 and composite backends, byte-identical between them, with every field offset checked against the Linux `hid-playstation` driver and a second independent consumer.
 - **Where hardware revisions disagree, the current one wins.** A DualSense made in 2020 reports the product string `Wireless Controller`. A DualSense made today reports `DualSense Wireless Controller`. Both report `bcdDevice` 0x0100, so nothing on the wire distinguishes them and a profile can only serve one. As of v1.4.5 `dualsense` and `dualsense-composite` serve the current string, because a consumer keyed to the launch string is already broken against real modern hardware. The launch string stays reachable on `dualsense-bt`, whose `dualsense-bt-full` sibling carries the current one.
+- **The same device on every life.** A virtual controller keeps its device paths, container id and USB serial across a dispose and recreate, a process restart, a reboot and a driver upgrade, so a program that stored a binding against the path or the serial keeps it. Pass an identity key that means something to you, or pass none and the controller index is the key:
+
+  ```csharp
+  using var pad = ctx.CreateController(profile, "slot0");   // same paths every time
+  ```
+
+  Every family is covered: plain HID parents take an explicit instance id with the child's `ParentIdPrefix` written before registration, the Xbox families take a fixed software-device tuple, and the composite personas serve a serial derived from the key. A different profile at the same key keeps the identity and refreshes the descriptor. Verified by a battery that measures parent, child, interface path, DirectInput GUID, SDL3 path and USB serial across nine lives per family. [How this works](docs/INTERNALS.md#stable-device-identity-across-lives).
 - **Protocol controllers, not just passive HID.** The Nintendo Switch Pro Controller is not a passive device: hosts drive a Nintendo subcommand handshake and stall without a device that answers. HIDMaestro's driver answers it over the real Bluetooth wire (the shipped descriptor is extracted byte-exact from a live Pro's SDP cache): SPI calibration reads, input-mode switch, 60 Hz full-mode streaming with gyro and accel at the 49-byte Bluetooth report size. SDL3's HIDAPI driver and Steam Input bind it as a real Bluetooth Pro Controller with motion and rumble. Before any protocol host arrives, the pad streams genuine 12-byte 0x3F simple-mode frames, the one report DirectInput can parse, so joy.cpl reads a working controller in exactly the states real hardware allows.
 
 ### Custom controllers
@@ -128,7 +135,7 @@ DirectInput, XInput, SDL3, the browser Gamepad API, and WGI/GameInput all see on
 - **Multiple controllers at once.** No hard limit. Verified with 6 mixed controllers, correct per-controller ordering across all APIs. XInput caps Xbox-family profiles at its own 4 slots.
 - **Force feedback.** HID PID 1.0 answers for DirectInput FFB games, plus rumble/haptic output events the consumer routes to real hardware.
 - **Hot-plug.** Create and remove controllers with no reboot. Live-swap a controller's profile mid-session. Warm single-controller create is ~200 ms.
-- **Validated across every API and both ends of the spectrum.** A 41-scenario regression battery checks DirectInput, XInput, SDL3/HIDAPI, the browser Gamepad API, and WGI on every change, and passes on both a 16-core Windows 11 desktop and a low-power Intel Atom Windows 10 fixture.
+- **Validated across every API and both ends of the spectrum.** A 59-scenario regression battery checks DirectInput, XInput, SDL3/HIDAPI, the browser Gamepad API, and WGI on every change. It passes on a 16-core Windows 11 desktop, and the 57-scenario v1.7.3 battery also passed on a low-power Intel Atom Windows 10 fixture.
 
 ### Validation
 
@@ -143,7 +150,7 @@ Tested on Windows 11 IoT Enterprise LTSC 2024 (build 26200) and Windows 10 IoT E
 
 The Xbox Series BT row shows 16 buttons because Windows' `xinputhid` synthesizes a 16-button layout over the 12-button source descriptor. [Details](docs/INTERNALS.md#validation-results).
 
-A 46-scenario [live-swap regression battery](test/regression/swap_regression.ps1) drives every create / swap / remove / force-kill sequence, the FFB round-trip, the Sony vendor-blob encode/decode, and the composite USB personas end to end through the real USB stack, verifying no PnP devnodes are left behind. 46/46 PASS on both a 16-core AMD Ryzen 9 Windows 11 desktop and a 4-core Intel Atom Z8350 Windows 10 fixture, the high and low ends of the performance and OS spectrum.
+A 59-scenario [live-swap regression battery](test/regression/swap_regression.ps1) drives every create / swap / remove / force-kill sequence, the FFB round-trip, the Sony vendor-blob encode/decode, the composite USB personas end to end through the real USB stack, and the device identity of every family across nine lives, verifying no PnP devnodes are left behind. 59/59 PASS on a 16-core AMD Ryzen 9 Windows 11 desktop. The 57-scenario v1.7.3 battery also passed 57/57 on a 4-core Intel Atom Z8350 Windows 10 fixture, the low end of the performance and OS spectrum.
 
 Full device-tree dumps, HIDAPI enumeration logs, per-profile results, and startup/teardown timing are in [docs/INTERNALS.md](docs/INTERNALS.md#validation-results).
 

@@ -27,6 +27,7 @@ internal static class UsbipBackend
     private static int s_staleSweepDone;
 
     public static UsbipBackendHandle CreateDevice(ControllerProfile profile, int index,
+                                                  DeviceIdentity? identity = null,
                                                   Action<string>? progress = null)
     {
         // Deploy on demand. Idempotent, and a no-op on every machine that
@@ -36,7 +37,7 @@ internal static class UsbipBackend
         var server = UsbipServer.GetOrStart();
         SweepStaleOnce(server.Port);
 
-        var device = new UsbipEmulatedDevice(profile, index);
+        var device = new UsbipEmulatedDevice(profile, index, identity);
         server.Register(device);
         try
         {

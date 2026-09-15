@@ -236,8 +236,21 @@ partial class Program
         // them by ID in stdin swap commands. Must come before the profile-ID
         // arguments. Multiple --profile-dir flags allowed.
         var extraProfileDirs = new List<string>();
+        // --identity-prefix <p> : give slot i the identity key "<p>:<i>"
+        // (issue #60) instead of the default index key. Live swaps keep
+        // the slot's key. Used by the identity battery to prove that a
+        // consumer-chosen key, not the index, is what the device paths
+        // follow.
+        string? identityPrefix = null;
         for (int i = 0; i < profileIds.Length; i++)
         {
+            if (profileIds[i] == "--identity-prefix" && i + 1 < profileIds.Length)
+            {
+                identityPrefix = profileIds[i + 1];
+                profileIds = profileIds.Where((_, idx) => idx != i && idx != i + 1).ToArray();
+                i = -1;
+                continue;
+            }
             if (profileIds[i] == "--rate-hz" && i + 1 < profileIds.Length
                 && int.TryParse(profileIds[i + 1], out int r) && r > 0 && r <= 4000)
             {
@@ -256,7 +269,7 @@ partial class Program
         }
         profileIds = profileIds.Where(p => p != "--paused-at-zero" && p != "--mark").ToArray();
         if (profileIds.Length == 0)
-            return Error("Usage: HIDMaestroTest emulate [--paused-at-zero] [--mark] [--rate-hz N] [--profile-dir <path>]... <profile-id> [profile-id ...]");
+            return Error("Usage: HIDMaestroTest emulate [--paused-at-zero] [--mark] [--rate-hz N] [--identity-prefix <p>] [--profile-dir <path>]... <profile-id> [profile-id ...]");
         // Under HIDMAESTRO_QUIET=1 (regression battery), the stdout pipe is
         // not drained by the harness between Send-Cmd calls. Per-controller
         // setup output (Loaded N profiles / Creating controller / ->created
@@ -296,7 +309,8 @@ partial class Program
             if (profile == null) return Error($"Profile not found: {profileIds[i]}");
             var perSlotSw = Stopwatch.StartNew();
             Console.WriteLine($"  Creating controller {i}: {profile.Id} ({profile.Name})");
-            var slot = new RunningController { Ctrl = ctx.CreateController(profile) };
+            string? identityKey = identityPrefix != null ? $"{identityPrefix}:{i}" : null;
+            var slot = new RunningController { Ctrl = ctx.CreateController(profile, identityKey) };
             Console.WriteLine($"    -> created in {perSlotSw.ElapsedMilliseconds} ms");
             // Pre-park BEFORE the pattern thread starts so the very first
             // submitted frame is (0, 0), not whatever the circle was at.
@@ -790,7 +804,10 @@ partial class Program
         // Pin to the same index so live switching preserves slot identity
         // (XInput slot, joy.cpl ordering, etc.). HMContext.CreateControllerAt
         // throws if the index is still in use; old.Ctrl.Dispose above frees it.
-        var fresh = new RunningController { Ctrl = ctx.CreateControllerAt(idx, profile) };
+        // The slot keeps its identity across the swap (issue #60): a
+        // different profile at the same key refreshes the descriptor at
+        // the same device paths.
+        var fresh = new RunningController { Ctrl = ctx.CreateControllerAt(idx, profile, old.Ctrl.IdentityKey) };
         HookOutputReceived(fresh.Ctrl, idx);
         slots[idx] = fresh;
         StartPatternThread(slots, idx);

@@ -332,7 +332,29 @@ public sealed class HMContext : IDisposable
     /// <exception cref="ArgumentException">The profile has no descriptor and isn't deployable.</exception>
     /// <exception cref="InvalidOperationException">Driver install failed or
     /// device node creation failed.</exception>
-    public HMController CreateController(HMProfile profile)
+    public HMController CreateController(HMProfile profile) => CreateController(profile, null);
+
+    /// <summary>Create a new virtual controller with a durable identity
+    /// (issue #60). <paramref name="identityKey"/> names the controller
+    /// the way the consumer thinks of it, such as a slot number plus a
+    /// profile id. Every device path, the container id and, for USB/IP
+    /// personas, the USB serial derive from the key, so a controller
+    /// created again with the same key comes back at the same paths
+    /// after a dispose, a process restart, a reboot or a driver upgrade.
+    /// Programs that store a binding against a device path or a serial
+    /// keep it across those lives.
+    ///
+    /// <para>A null or empty key uses the controller index, which is what
+    /// <see cref="CreateController(HMProfile)"/> does. Two live controllers
+    /// in one context cannot share a key; dispose the first before creating
+    /// the second. A different profile at the same key keeps the identity
+    /// and refreshes the descriptor.</para></summary>
+    /// <exception cref="ArgumentNullException"><paramref name="profile"/> is null.</exception>
+    /// <exception cref="ArgumentException">The profile has no descriptor and isn't deployable.</exception>
+    /// <exception cref="InvalidOperationException">Driver install failed,
+    /// device node creation failed, or the key is in use by a live
+    /// controller of this context.</exception>
+    public HMController CreateController(HMProfile profile, string? identityKey)
     {
         if (profile == null) throw new ArgumentNullException(nameof(profile));
         if (!profile.IsDeployable)
@@ -349,6 +371,8 @@ public sealed class HMContext : IDisposable
             index = 0;
             while (_controllers.ContainsKey(index)) index++;
         }
+        var identity = Internal.DeviceIdentity.Resolve(identityKey, index);
+        ThrowIfIdentityInUse(identity);
 
         // Issue #39: composite USB personas run on the USB/IP backend,
         // never on UMDF2, which can only present the single HID interface
@@ -357,7 +381,7 @@ public sealed class HMContext : IDisposable
         // deploys itself on first use, so this path needs no precondition
         // from the consumer. The UMDF2 path below is untouched.
         if (profile.RequiresUsbipBackend)
-            return CreateUsbipController(index, profile);
+            return CreateUsbipController(index, profile, identity);
 
         // The driver INF lives next to the driver binaries in the repo's
         // build/ directory. This will move to embedded-resource extraction
@@ -369,7 +393,7 @@ public sealed class HMContext : IDisposable
         try
         {
             instanceId = Internal.DeviceOrchestrator.SetupController(
-                index, profile.Inner, infPath);
+                index, profile.Inner, infPath, identity);
         }
         catch
         {
@@ -378,22 +402,37 @@ public sealed class HMContext : IDisposable
             throw;
         }
 
-        var controller = new HMController(this, index, profile, instanceId);
+        var controller = new HMController(this, index, profile, instanceId, identityKey: identity.Key);
         lock (_lock) _controllers[index] = controller;
         return controller;
+    }
+
+    /// <summary>Two live controllers with one key would race for the same
+    /// devnode instance ids. Refuse the second before any PnP work.</summary>
+    private void ThrowIfIdentityInUse(Internal.DeviceIdentity identity)
+    {
+        lock (_lock)
+        {
+            foreach (var live in _controllers.Values)
+            {
+                if (string.Equals(live.IdentityKey, identity.Key, StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        $"Identity key '{identity.Key}' is in use by the live controller at index {live.Index}. Dispose it first.");
+            }
+        }
     }
 
     // Issue #39: the USB/IP create path. The backend's device emulator
     // pre-creates the per-index shared sections and events, attaches
     // through usbip-win2's vhci, and the HMController then binds to the
     // same sections it always does. No PnP, no INF, no driver install.
-    private HMController CreateUsbipController(int index, HMProfile profile)
+    private HMController CreateUsbipController(int index, HMProfile profile, Internal.DeviceIdentity identity)
     {
         Internal.Usbip.UsbipBackendHandle handle =
-            Internal.Usbip.UsbipBackend.CreateDevice(profile.Inner, index);
+            Internal.Usbip.UsbipBackend.CreateDevice(profile.Inner, index, identity);
         try
         {
-            var controller = new HMController(this, index, profile, instanceId: null, handle);
+            var controller = new HMController(this, index, profile, instanceId: null, handle, identity.Key);
             lock (_lock) _controllers[index] = controller;
             return controller;
         }
@@ -412,7 +451,14 @@ public sealed class HMContext : IDisposable
     /// (the previous controller at that index must already be disposed).</summary>
     /// <exception cref="InvalidOperationException">If the index is already
     /// in use by another live controller.</exception>
-    public HMController CreateControllerAt(int index, HMProfile profile)
+    public HMController CreateControllerAt(int index, HMProfile profile) => CreateControllerAt(index, profile, null);
+
+    /// <summary>Create a controller pinned to a specific index with a
+    /// durable identity key. See <see cref="CreateController(HMProfile, string)"/>
+    /// for what the key does. A null or empty key uses the index.</summary>
+    /// <exception cref="InvalidOperationException">If the index or the key
+    /// is already in use by another live controller.</exception>
+    public HMController CreateControllerAt(int index, HMProfile profile, string? identityKey)
     {
         if (profile == null) throw new ArgumentNullException(nameof(profile));
         if (!profile.IsDeployable)
@@ -426,12 +472,14 @@ public sealed class HMContext : IDisposable
                 throw new InvalidOperationException(
                     $"Controller index {index} is already in use. Dispose the existing controller first.");
         }
+        var identity = Internal.DeviceIdentity.Resolve(identityKey, index);
+        ThrowIfIdentityInUse(identity);
 
         // Issue #39: same backend routing as CreateController. Live-swap
         // consumers can pin a composite persona to an index like any
         // other profile.
         if (profile.RequiresUsbipBackend)
-            return CreateUsbipController(index, profile);
+            return CreateUsbipController(index, profile, identity);
 
         string infPath = System.IO.Path.Combine(
             Internal.DriverBuilder.BuildDir, "hidmaestro.inf");
@@ -440,7 +488,7 @@ public sealed class HMContext : IDisposable
         try
         {
             instanceId = Internal.DeviceOrchestrator.SetupController(
-                index, profile.Inner, infPath);
+                index, profile.Inner, infPath, identity);
         }
         catch
         {
@@ -448,7 +496,7 @@ public sealed class HMContext : IDisposable
             throw;
         }
 
-        var controller = new HMController(this, index, profile, instanceId);
+        var controller = new HMController(this, index, profile, instanceId, identityKey: identity.Key);
         lock (_lock) _controllers[index] = controller;
         return controller;
     }

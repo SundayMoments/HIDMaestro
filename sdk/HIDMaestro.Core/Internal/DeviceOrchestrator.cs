@@ -24,60 +24,21 @@ internal static class DeviceOrchestrator
 
     private static bool s_ghostsCleaned;
 
-    /// <summary>
-    /// Per-process base for SwD instance-ID suffixes. Combined with a
-    /// per-creation atomic sequence number (see <see cref="NextSwdSuffix"/>)
-    /// so every SwDeviceCreate call within this process gets a UNIQUE
-    /// (enumerator + suffix + ContainerId) tuple. Required because Windows
-    /// retains a sticky per-container record after SwDeviceClose — a
-    /// subsequent SwDeviceCreate with an IDENTICAL tuple takes a fast
-    /// "re-enumerate" path that leaves the devnode as an empty shell
-    /// (no Service/Driver bound, no interface classes registered). The bug
-    /// reproduces both across-process AND within-process: prior fix only
-    /// varied across process launches, leaving same-process live-swap
-    /// recreations broken on the 2nd swap onward. FindExistingCompanion
-    /// matches by ControllerIndex in Device Parameters (not by suffix), so
-    /// varying suffixes per call is transparent to teardown / sweep code.
-    ///
-    /// <para>v1.3.5 — mix high-resolution process-start ticks (and a small
-    /// random component) into the session ID. PID alone is insufficient on
-    /// busy hosts where Windows may reuse the same PID across separate test
-    /// runs within hours. Atom 2026-04-30 vs 2026-05-06: PID 0x10E8 reused,
-    /// per-process seq counter restarted from 0, identical (suffix + container)
-    /// tuple regenerated, kernel hit the reuse-existing fast path, S08
-    /// teardown failed E_ACCESSDENIED on the resurrected ghost.</para>
-    /// </summary>
-    private static readonly string s_sessionId = ComputeSessionId();
-
-    private static string ComputeSessionId()
-    {
-        // 32-bit PID component (typically 4-5 hex chars) + 32-bit ticks low
-        // (changes every <50 days) + 16-bit random (defense in depth).
-        // Total ~16 hex chars — still well under SetupAPI's 200-char instance
-        // ID limit. Atomic across this process; never collides with itself.
-        int pid    = System.Diagnostics.Process.GetCurrentProcess().Id;
-        long ticks = DateTime.UtcNow.Ticks;
-        int  rnd   = System.Random.Shared.Next();
-        // Combine to 12 hex chars: 8 from XOR(pid, ticks low), 4 from rnd low.
-        uint mix1 = (uint)pid ^ (uint)(ticks & 0xFFFFFFFF);
-        uint mix2 = (uint)((ticks >> 32) & 0xFFFFFFFF) ^ (uint)rnd;
-        return $"{mix1:X8}{(mix2 & 0xFFFF):X4}".ToUpperInvariant();
-    }
-
-    private static int s_swdCreateSeq;
-
-    /// <summary>
-    /// Generates a unique SwD instance-suffix for one SwDeviceCreate call.
-    /// Format: "&lt;session-hex&gt;&lt;seq-hex&gt;_&lt;ctrl-idx&gt;". Sequence number
-    /// is process-scoped and atomic; combined with the 12-char session prefix
-    /// (PID + ticks + random) the tuple is globally unique even when Windows
-    /// reuses a PID across separate test runs.
-    /// </summary>
-    private static string NextSwdSuffix(int controllerIndex)
-    {
-        int seq = System.Threading.Interlocked.Increment(ref s_swdCreateSeq);
-        return $"{s_sessionId}{seq:X4}_{controllerIndex:D4}";
-    }
+    // SwD instance suffixes are the controller's DeviceIdentity token
+    // (issue #60): the same (enumerator + suffix + ContainerId) tuple on
+    // every life of one identity. From v1.1.30 to v1.7.3 the suffix was
+    // unique per SwDeviceCreate call, because a DIF_REMOVE on a
+    // SWDeviceLifetimeParentPresent device left the software device alive
+    // and a create with the same tuple reconnected to that half-removed
+    // shell. Teardown has gone through SwDeviceSetLifetime(Handle) +
+    // SwDeviceClose since v1.1.31, which destroys the software device, and
+    // a fixed tuple recreates cleanly after it: measured on 26200 as three
+    // lives each of the gamepad companion (Service bound, HID child started)
+    // and the XUSB companion (interface published), with the phantom record
+    // retained and with it purged, and with a fast remove that returned
+    // before the cascade finished. The one thing that does leave an empty
+    // shell is an instance key that exists BEFORE SwDeviceCreate, which
+    // nothing here does.
 
     // ════════════════════════════════════════════════════════════════════
     //  Diagnostic log for teardown investigations — gated by env var
@@ -468,9 +429,19 @@ internal static class DeviceOrchestrator
             // vJoy instances. Gate the destructive call on HardwareID proof.
             bool exclusivePrefix =
                 prefix.EndsWith(@"\HIDMAESTRO", StringComparison.OrdinalIgnoreCase);
-            for (int idx = 0; idx < 10; idx++)
+            // Every instance name under the enumerator, not 0000..0009:
+            // identity-named parents (ROOT\HIDCLASS\HM_0000, issue #60)
+            // live here too, and a crashed prior session leaves them live.
+            string[] instNames;
+            try
             {
-                string instId = $@"{prefix}\{idx:D4}";
+                using var prefixKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{prefix}");
+                instNames = prefixKey?.GetSubKeyNames() ?? Array.Empty<string>();
+            }
+            catch { instNames = Array.Empty<string>(); }
+            foreach (var instName in instNames)
+            {
+                string instId = $@"{prefix}\{instName}";
                 if (CM_Locate_DevNodeW(out _, instId, 0) != 0) continue;
                 if (!exclusivePrefix && !DeviceManager.IsHidMaestroOwned(instId)) continue;
                 DeviceManager.RemoveDevice(instId, fast: true);
@@ -907,7 +878,8 @@ internal static class DeviceOrchestrator
     //  CreateGamepadCompanion (xinputhid path)
     // ════════════════════════════════════════════════════════════════════
 
-    private static string? CreateGamepadCompanion(int controllerIndex, ControllerProfile profile)
+    private static string? CreateGamepadCompanion(int controllerIndex, ControllerProfile profile,
+                                                  DeviceIdentity identity)
     {
         string gpVid = $"{profile.VendorId:X4}";
         string gpPid = $"{profile.ProductId:X4}";
@@ -980,18 +952,17 @@ internal static class DeviceOrchestrator
             // `&` between VID and PID for `_` breaks the substring match
             // without touching anything else.
             string gpSwdEnumerator = gpEnumeratorSwd;
-            // Per-call unique instance suffix bypasses Windows' sticky
-            // per-container "recently-here" fast path that otherwise leaves
-            // this devnode as an empty shell on RECREATION (across-process
-            // or within-process — e.g. PadForge live-profile-swap).
-            string instanceSuffix = NextSwdSuffix(controllerIndex);
+            // The identity's token: the same instance id on every life
+            // (issue #60; see the note above CreateGamepadCompanion's
+            // caller on why a fixed tuple is safe now).
+            string instanceSuffix = identity.Token;
             string companionDesc = profile.DeviceDescription ?? profile.ProductString ?? "HIDMaestro Gamepad";
 
             var result = SwdDeviceFactory.Create(
                 instanceSuffix,
                 hardwareIds,
                 compatList.ToArray(),
-                SwdDeviceFactory.ContainerIdFor(controllerIndex),
+                identity.ContainerId,
                 companionDesc,
                 driverRequired: true,
                 enumeratorName: gpSwdEnumerator);
@@ -1026,6 +997,17 @@ internal static class DeviceOrchestrator
         //    for the HID child to appear (replaces a fixed 2000ms sleep).
         if (gpInstId != null)
         {
+            // Issue #60. SwDeviceCreate binds and starts the driver inside
+            // the call, so the HID child has already enumerated with
+            // whatever ParentIdPrefix the parent's key held: the retained
+            // value from the last life, or a fresh counter when the record
+            // was purged. Put the identity's value in now; the restart
+            // that follows re-enumerates the child under it. Measured on
+            // 26200: after a purge the child came back as 1&hash&N first,
+            // and as the identity's 1&hash&0 after this write + restart,
+            // three lives in a row. When the value already matches this
+            // is a no-op.
+            DeviceIdentity.ApplyParentIdPrefix(gpInstId, identity.ParentIdPrefix, createKey: false);
             DeviceManager.RestartDevice(gpInstId);
 
             // Poll for HID child PDO to be created by HIDClass below our parent.
@@ -1041,7 +1023,8 @@ internal static class DeviceOrchestrator
     //  CreateXusbCompanion (non-xinputhid Xbox path)
     // ════════════════════════════════════════════════════════════════════
 
-    private static string? CreateXusbCompanion(int controllerIndex, ControllerProfile profile)
+    private static string? CreateXusbCompanion(int controllerIndex, ControllerProfile profile,
+                                               DeviceIdentity identity)
     {
         // Look for a live HIDMAESTRO already claimed by THIS controllerIndex.
         // The "HIDMAESTRO" enumerator name is load-bearing for WGI's
@@ -1088,18 +1071,16 @@ internal static class DeviceOrchestrator
                 "USB\\Class_FF",
             };
             string companionDesc = profile.DeviceDescription ?? profile.ProductString ?? "Controller";
-            // Per-call unique instance suffix — same rationale as the
-            // gamepad-companion path: bypass the kernel's sticky per-container
-            // "recently-here" fast path that leaves HIDMAESTRO devnodes as
-            // empty shells (no Service/Driver, no XUSB interface registered)
-            // on RECREATION (across-process or within-process live-swap).
-            string instanceSuffix = NextSwdSuffix(controllerIndex);
+            // The identity's token, fixed across lives (issue #60). The
+            // companion has no HID child, so its XUSB interface path is
+            // SWD#HIDMAESTRO#<token>#{EC87F1E3-...} on every life.
+            string instanceSuffix = identity.Token;
 
             var result = SwdDeviceFactory.Create(
                 instanceSuffix,
                 hardwareIds,
                 compatIds,
-                SwdDeviceFactory.ContainerIdFor(controllerIndex),
+                identity.ContainerId,
                 companionDesc,
                 driverRequired: true,
                 enumeratorName: "HIDMAESTRO");
@@ -1303,12 +1284,20 @@ internal static class DeviceOrchestrator
         // device.
         foreach (string enumer in new[] { "HID_IG_00", "HIDClass", "XnaComposite" })
         {
-            // Sweep both ROOT and SWD roots for this enumerator.
+            // Sweep both ROOT and SWD roots for this enumerator. Every
+            // instance name, since ours are identity tokens (issue #60).
             foreach (var enumRoot in new[] { "ROOT", "SWD" })
             {
-                for (int idx = 0; idx < 10; idx++)
+                string[] instNames;
+                try
                 {
-                    string devId = $@"{enumRoot}\{enumer}\{idx:D4}";
+                    using var ek = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{enumRoot}\{enumer}");
+                    instNames = ek?.GetSubKeyNames() ?? Array.Empty<string>();
+                }
+                catch { instNames = Array.Empty<string>(); }
+                foreach (var instName in instNames)
+                {
+                    string devId = $@"{enumRoot}\{enumer}\{instName}";
                     if (CM_Locate_DevNodeW(out uint devInst, devId, 0) != 0) continue;
                     if (!DeviceManager.IsHidMaestroOwned(devId)) continue;
                     CM_Set_DevNode_PropertyW(devInst, ref busTypeKey, 0x0D,
@@ -1364,13 +1353,14 @@ internal static class DeviceOrchestrator
     // ════════════════════════════════════════════════════════════════════
 
     public static string? SetupController(
-        int controllerIndex, ControllerProfile profile, string infPath)
+        int controllerIndex, ControllerProfile profile, string infPath, DeviceIdentity? identity = null)
     {
         if (profile == null) throw new ArgumentNullException(nameof(profile));
         if (controllerIndex < 0) throw new ArgumentOutOfRangeException(nameof(controllerIndex));
         if (!profile.HasDescriptor)
             throw new ArgumentException(
                 $"Profile '{profile.Id}' has no HID descriptor.", nameof(profile));
+        identity ??= DeviceIdentity.ForIndex(controllerIndex);
 
         // Defense-in-depth gate: block until any in-flight TeardownController
         // for this controllerIndex has fully completed (including
@@ -1388,7 +1378,7 @@ internal static class DeviceOrchestrator
         WaitForPriorTeardown(controllerIndex);
 
         var setupTotalSw = Stopwatch.StartNew();
-        LogDiag($">>> SETUP  ENTER ctrl={controllerIndex} profile={profile.Id} vid=0x{profile.VendorId:X4} pid=0x{profile.ProductId:X4} uses_upper_filter={profile.UsesUpperFilter} companion_only={profile.CompanionOnly}");
+        LogDiag($">>> SETUP  ENTER ctrl={controllerIndex} profile={profile.Id} vid=0x{profile.VendorId:X4} pid=0x{profile.ProductId:X4} uses_upper_filter={profile.UsesUpperFilter} companion_only={profile.CompanionOnly} identity={identity}");
         string? returnedId = null;
         try {
         using var _total = new TimingScope(controllerIndex, profile.Id, "TOTAL");
@@ -1490,7 +1480,7 @@ internal static class DeviceOrchestrator
             // xinputhid path: companion-only (no main HID device)
             var createSw = Stopwatch.StartNew();
             using var _ts = new TimingScope(controllerIndex, profile.Id, "3.create_gamepad_companion");
-            companionId = CreateGamepadCompanion(controllerIndex, profile);
+            companionId = CreateGamepadCompanion(controllerIndex, profile, identity);
             LogDiag($"    CreateGamepadCompanion -> {(companionId ?? "(null)")} in {createSw.ElapsedMilliseconds}ms");
         }
         else if (!profile.CompanionOnly)
@@ -1498,7 +1488,7 @@ internal static class DeviceOrchestrator
             // Plain HID or non-xinputhid Xbox: create main device node
             var createSw = Stopwatch.StartNew();
             using var _ts = new TimingScope(controllerIndex, profile.Id, "3.create_main_devnode");
-            var result = DeviceNodeCreator.CreateDeviceNode(profile, infPath, controllerIndex);
+            var result = DeviceNodeCreator.CreateDeviceNode(profile, infPath, controllerIndex, identity);
             if (!result.Success || result.InstanceId == null)
             {
                 LogDiag($"    DeviceNodeCreator.CreateDeviceNode FAILED after {createSw.ElapsedMilliseconds}ms");
@@ -1600,7 +1590,7 @@ internal static class DeviceOrchestrator
         {
             var xusbSw = Stopwatch.StartNew();
             using (var _ts = new TimingScope(controllerIndex, profile.Id, "5.create_xusb_companion"))
-                xusbCompanionId = CreateXusbCompanion(controllerIndex, profile);
+                xusbCompanionId = CreateXusbCompanion(controllerIndex, profile, identity);
             LogDiag($"    CreateXusbCompanion -> {(xusbCompanionId ?? "(null)")} in {xusbSw.ElapsedMilliseconds}ms");
             if (profile.CompanionOnly && companionId == null)
                 companionId = xusbCompanionId;

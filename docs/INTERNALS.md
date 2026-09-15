@@ -80,7 +80,7 @@ Windows has a built-in GameInput mapping database for known VID/PIDs. HIDMaestro
 
 WGI (`Windows.Gaming.Input.dll`) admits devices into its provider graph through `ProviderManagerWorker::OnPnpDeviceAdded`. A Ghidra decomp of that function on Win11 26200 showed the gate: WGI accepts a device only if its ClassGuid is in a hard-coded four-entry pass-list (`HIDClass`, `XnaComposite`, one other setup class, one GameInput class) OR if `IsDeviceOrAncestorFilteredBy(path, L"xinputhid")` returns true. The fallback check is a literal `wcsncmp` against strings in the device's (or any ancestor's) `UpperFilters` MULTI_SZ.
 
-HIDMaestro's XUSB companion (`SWD\HIDMAESTRO\<sid>_NNNN`) runs under the System class `{4d36e97d-...}`. That class is not on the pass-list, so before this work WGI silently skipped the companion despite it publishing the XUSB device interface — Chromium's `put_Vibration` went nowhere for Xbox 360 Wired.
+HIDMaestro's XUSB companion (`SWD\HIDMAESTRO\<token>`) runs under the System class `{4d36e97d-...}`. That class is not on the pass-list, so before this work WGI silently skipped the companion despite it publishing the XUSB device interface — Chromium's `put_Vibration` went nowhere for Xbox 360 Wired.
 
 The fix writes the string `"xinputhid"` to the companion's `UpperFilters` registry value via the INF's `HKR` AddReg. `xinputhid.sys` is a HID-class filter, so it never actually attaches to the System-class companion; the string sits inert in the registry and WGI's wstring compare passes anyway. The companion enters WGI via the XUSB dispatch path, and `IOCTL_XUSB_SET_STATE` starts reaching the driver with real motor bytes on `put_Vibration`.
 
@@ -100,13 +100,41 @@ The xinputhid-path profiles (Xbox Series BT etc.) moved fully to `SWD\HIDMAESTRO
 
 The underscore between VID and PID in the gamepad-companion enumerator (`HIDMAESTRO_VID_045E_PID_0B13&IG_00`, not `...VID_045E&PID_0B13...`) avoids a Windows PnP edge case in which any SWD enumerator name matching the substring `VID_*&PID_*&IG_*` registers in the registry but never enumerates as a live devnode. The `&IG_00` suffix is preserved because the HID child inherits its parent's enumerator name as the first segment of its instance path, and HIDAPI/SDL3/Chromium all blocklist `&IG_` substrings to avoid duplicating XInput-claimed devices.
 
-### Session-Unique Instance-ID Suffix
+### Stable Device Identity Across Lives
 
-The SWD migration immediately exposed a second Windows PnP behavior: after `SwDeviceClose` finalizes a devnode with `SWDeviceLifetimeParentPresent`, the kernel retains a sticky per-`(enumerator + instanceId + ContainerId)` record. A subsequent `SwDeviceCreate` with the identical tuple takes a "reuse-existing" fast path that creates an empty registry shell — no Service or Driver bound, no device-interface class registered — and reports success to the caller. The sticky state survives across processes and across same-boot uninstall + reinstall of the INF.
+Since v1.8.0 (issue #60) every virtual controller has a durable identity, and every id a consumer can key on comes back the same on each life of that controller: the same process recreating it, a process restart, a reboot, and a driver upgrade. The identity is the consumer's key, passed as the second argument of `CreateController` and `CreateControllerAt`. A caller that passes none gets the controller index as its key, which is what every caller got before.
 
-Symptoms before the fix: first run after a fresh boot was fast and all APIs passed, but every subsequent run on the same boot saw `SwDeviceCreate` return `S_OK` synchronously while the devnode never materialized. `CM_Locate_DevNodeW` returned `CR_NO_SUCH_DEVNODE` the entire time the SDK waited; the creation callback timed out at 30s with `E_FAIL`. Phase-1 creation ballooned from ~2s to 65s (15s callback wait × 2 BT slots + 15s XInput slot-claim wait × 2 Xbox 360 slots), and XInput lost visibility for the XUSB-companion path because the empty-shell devnode never bound `HMXInput.dll` and so never registered the XUSB device-interface class.
+What consumers key on, measured on 26200: DirectInput's instance GUID is a per-VID/PID ordinal in `HKCU` and was stable already. SDL's joystick path is the HID interface path. Steam keys a USB/IP persona's configuration on its USB serial. Windows.Gaming.Input and GameInput key on the ContainerId and the device path. XInput keys on the slot only. Before v1.8.0 the HID interface path changed on every life, because every parent devnode was created with a Windows-generated instance name and its `ParentIdPrefix`, the `1&hash&n` value the HID child's instance id is built from, was minted again each time: one reporter's pad had counted 74 lives.
 
-Fix: prepend the current process's PID in hex to every SwD instance-id suffix, e.g. `SWD\HIDMAESTRO\A7B4_0002`. Each launch gets a unique tuple, the kernel runs a fresh full install, and the devnode binds correctly. `FindExistingCompanion` matches by `Device Parameters\ControllerIndex` (not by suffix) so cleanup and teardown sweep across instances regardless of which session created them. Verified on this machine: 5 back-to-back same-boot 4-controller runs all complete Phase 1 in 2.2-2.8s with `verify.py` ALL PASS and zero registry-carcass accumulation post-teardown.
+Every derived value is a pure function of the key, nothing is stored, and the mechanism differs per family:
+
+| Family | Parent | How the child path stays put |
+|--------|--------|------------------------------|
+| Plain HID (Sony UMDF2, generic pads, wheels) | `ROOT\HIDClass\HM_0000` (SetupAPI, explicit instance id) | The identity's `ParentIdPrefix` is written into the instance key between `SetupDiCreateDeviceInfo` and `DIF_REGISTERDEVICE`. PnP reads the value from the parent's key when the HID child first arrives and mints a counter only when it is absent. |
+| Non-xinputhid Xbox (Xbox 360 wired) | `ROOT\VID_045E&PID_028E&IG_00\HM_0000` (SetupAPI) plus `SWD\HIDMAESTRO\HM_0000` (SwDevice) | Main devnode as above. The XUSB companion has no HID child, so a fixed SwDevice tuple is the whole fix. Its interface path is `SWD#HIDMAESTRO#HM_0000#{EC87F1E3-...}` on every life. |
+| xinputhid Xbox (Xbox Series, One, Elite over Bluetooth) | `SWD\HIDMAESTRO_VID_045E_PID_0B13&IG_00\HM_0000` (SwDevice) | Fixed SwDevice tuple. `SwDeviceCreate` binds and starts the driver inside the call, so the child has already enumerated by the time the SDK can write anything. The identity's prefix is reconciled into the key afterwards, and the restart the creation path already performs re-keys the child under it. |
+| USB/IP composite personas | `USB\VID_054C&PID_0CE6\<serial>` (usbccgp) | A profile without a captured serial (the Sony composites) serves the identity's synthetic serial at a string index the descriptor did not use, so Windows keys the USB instance on the serial instead of the vhci port. Profiles with a captured serial keep it, varied by identity. The composite parent's own `ParentIdPrefix` persists in its phantom record the way it does for real hardware. |
+
+`HM_0000` is the token for the default key of index 0. A consumer key derives `HM_` plus sixteen hex digits, a container GUID of the same `HIDMAESTRO` family, a `1&hash&0` prefix and a `HM` plus twelve hex digit serial, all from one SHA-256 of the key.
+
+The session-unique instance-id suffix that v1.1.30 through v1.7.3 put on every SwDevice call is gone. It existed because a `DIF_REMOVE` on a `SWDeviceLifetimeParentPresent` device left the software device alive in the kernel, and a create with the same tuple reconnected to that half-removed shell: `S_OK` with no Service, no driver, no interface. Teardown has gone through `SwDeviceSetLifetime(Handle)` plus `SwDeviceClose` since v1.1.31, which destroys the software device, and the reuse works after it. The identity lab (`test/probes/identity_lab`, run on 26200, three lives per variant) measured the matrix the issue asked for:
+
+| Variant | Bound | Same parent | Same child |
+|---------|-------|-------------|------------|
+| Unique SwDevice suffix, fixed container (v1.7.3 behavior) | yes | no | no |
+| Fixed suffix, fixed container, phantom record retained | yes | yes | yes |
+| Fixed suffix, fixed container, phantom record purged between lives | yes | yes | no (counter 0, 1, 2) |
+| Fixed suffix, purged, prefix written after create plus restart | yes | yes | yes |
+| Fixed suffix, changing container, retained | yes | yes | yes |
+| Fixed suffix, fast remove without waiting for the cascade, immediate recreate | yes | yes | yes |
+| XUSB companion, fixed suffix, retained or purged or changing container | yes | yes | (no child) |
+| ROOT parent, explicit instance id, no prefix written | yes | yes | no (counter 0, 1, 2) |
+| ROOT parent, explicit id, prefix written before registration | yes | yes | yes |
+| Instance key created BEFORE `SwDeviceCreate` | **no** | | |
+
+The last row is the one hazard: a `SWD` instance key that exists before the software device does leaves a record PnP stamps with a SYSTEM-only `Properties` subkey and never enumerates, and an administrator cannot delete it. Nothing in the SDK creates one. The ROOT path may write into its key before registration, because SetupAPI itself creates that key.
+
+Two consequences for consumers. A DirectInput ordinal still moves when a same-VID/PID pad in front of it leaves (that is DirectInput's rule, not ours), while the path and serial of the remaining pad do not. And a different profile at the same key keeps the identity and refreshes the descriptor: the battery swaps a DualShock 4 in at a DualSense's key and reads the new attributes at the old paths.
 
 ## Architecture
 
@@ -122,9 +150,12 @@ User-Mode Test App
   │     Event-driven: SDK signals InputDataEvent on each write.
   │
   ├──► Main HID Device (HIDMaestro.dll via mshidumdf)
-  │     Xbox 360 Wired:    ROOT\VID_045E&PID_028E&IG_00\NNNN
-  │     Xbox Series BT:    SWD\HIDMAESTRO_VID_045E_PID_0B13&IG_00\<sid>_NNNN
-  │     Plain HID:         ROOT\VID_xxxx&PID_yyyy&IG_00\NNNN
+  │     Xbox 360 Wired:    ROOT\VID_045E&PID_028E&IG_00\HM_0000
+  │     Xbox Series BT:    SWD\HIDMAESTRO_VID_045E_PID_0B13&IG_00\HM_0000
+  │     Plain HID:         ROOT\HIDClass\HM_0000
+  │     (HM_0000 is the identity token of index 0; a consumer key
+  │      derives HM_ plus sixteen hex digits. See Techniques: Stable
+  │      Device Identity.)
   │     ├─ HID descriptor with Vx/Vy velocity triggers
   │     ├─ Event-driven worker reads shared memory → HID READ_REPORT
   │     │   (seqno-gated: idle CPU cost ~0.04% per controller)
@@ -132,10 +163,9 @@ User-Mode Test App
   │     │   pContainerId (xinputhid path only) so xinput1_4!FUN_18000de2c
   │     │   does not flag the devnode as embedded/primary and skip slot 0.
   │     │   See Techniques: SWD Migration for the slot-1-skip fix.
-  │     ├─ Per-process session-id prefix on instance-id suffix
-  │     │   (`<pid-hex>_NNNN`) so Windows PnP's sticky per-container
-  │     │   reuse-fast-path doesn't leave subsequent-run devnodes as
-  │     │   empty registry shells. See Techniques: Session-Unique Suffix.
+  │     ├─ Identity token as the instance name and the identity's
+  │     │   ParentIdPrefix on the parent, so the HID child's path is the
+  │     │   same on every life. See Techniques: Stable Device Identity.
   │     ├─ USB interface (XUSB-companion profiles also get the xinputhid
   │     │   UpperFilter written per-instance by the SDK — see Techniques)
   │     ├─ Legacy WinExInput interface registration retained for historical
@@ -144,7 +174,7 @@ User-Mode Test App
   │     └─ BTHLEDEVICE CompatibleIDs (Bluetooth profiles)
   │
   └──► XUSB Companion (HMXInput.dll, System class)
-        SWD\HIDMAESTRO\<sid>_NNNN  (non-xinputhid Xbox profiles only)
+        SWD\HIDMAESTRO\HM_0000  (non-xinputhid Xbox profiles only)
         ├─ XUSB interface {EC87F1E3-...} → XInput discovery + WGI dispatch
         ├─ UpperFilters = "xinputhid" (pure registry-string tripwire that
         │     admits the device to WGI's XUSB path without xinputhid.sys
@@ -207,7 +237,7 @@ Full per-profile results, device-tree dumps, HIDAPI enumeration logs, and timing
 
 Cold start includes certificate creation, signing, catalog generation, driver package installation, and device creation. This only happens on first run or after SDK updates. Warm start uses event-driven polled waits that exit as soon as PnP is ready. Zero fixed `Thread.Sleep` calls remain in any creation, cleanup, or finalization path. Controllers are independently disposable: removing one does not disturb the others.
 
-**Same-boot run-to-run consistency:** every launch matches the fresh-boot Phase-1 timing. The earlier regression where subsequent same-boot runs took 65s (and lost XInput visibility for the XUSB-companion path) is fixed by the per-process session-id prefix on SWD instance-ids — see Techniques: Session-Unique Instance-ID Suffix.
+**Same-boot run-to-run consistency:** every launch matches the fresh-boot Phase-1 timing. The earlier regression where subsequent same-boot runs took 65s (and lost XInput visibility for the XUSB-companion path) came from reconnecting to a half-removed software device; the handle-lifetime teardown removed the cause, and since v1.8.0 every life reuses one fixed instance name. See Techniques: Stable Device Identity.
 
 **Per-step install breakdown** (visible in stdout when `HMContext.InstallDriver` runs): extract ~20ms · remove old packages ~100ms · sign ~130ms · generate catalogs ~840ms (the largest single step, AV-sensitive) · install drivers ~580ms · total ~1.7s on a clean machine. On corporate workstations with hundreds of devices in the PnP tree, total install can stretch to 5-20s; HIDMaestro doesn't run `pnputil /scan-devices` (it's a no-op for our INFs and was the largest variable contributor).
 
@@ -224,8 +254,10 @@ Disposal speed depends on which kernel-side drivers are in the device stack. Eac
 Profiles where `driverMode` is not `"xinputhid"` and the VID is not Microsoft (`0x045E`). Includes DualSense, DualShock 4, all Logitech wheels, Thrustmaster HOTAS, flight sticks, pedals, arcade sticks, and most of the 225-profile catalog.
 
 ```
-ROOT\VID_054C&PID_0CE6\NNNN          ← our UMDF2 driver (mshidumdf host)
-  └─ HID\VID_054C&PID_0CE6\...       ← raw HID PDO, no upper filter
+ROOT\HIDClass\HM_0000               ← our UMDF2 driver (mshidumdf host)
+  └─ HID\HIDCLASS\1&hash&0&0000     ← raw HID PDO, no upper filter; the
+                                       prefix is the identity's, written
+                                       before registration
 ```
 
 **Lightest stack.** One `DIF_REMOVE` on the ROOT parent tears down the entire tree. No XUSB companion device, no Microsoft upper filter. Creation ~200ms, disposal ~80ms.
@@ -235,7 +267,7 @@ ROOT\VID_054C&PID_0CE6\NNNN          ← our UMDF2 driver (mshidumdf host)
 Xbox-VID profiles (`0x045E`) where xinputhid is not in the path. XInput is delivered via a separate SWD-enumerated XUSB companion device running `HMXInput.dll`. WGI dispatch also runs through that companion, admitted by the xinputhid UpperFilter tripwire described in Techniques.
 
 ```
-ROOT\VID_045E&PID_028E&IG_00\NNNN    ← our UMDF2 driver (main HID device)
+ROOT\VID_045E&PID_028E&IG_00\HM_0000 ← our UMDF2 driver (main HID device)
   │                                    UpperFilters += "xinputhid" per-instance
   │                                    (in the SetupDi property state BEFORE
   │                                    DIF_REGISTERDEVICE, plus one deliberate
@@ -247,18 +279,16 @@ ROOT\VID_045E&PID_028E&IG_00\NNNN    ← our UMDF2 driver (main HID device)
   │                                    a second HID-backed Gamepad for this
   │                                    logical controller)
   └─ HID\VID_045E&PID_028E&IG_00\... ← HID child (raw PDO, input.inf)
-SWD\HIDMAESTRO\<sid>_NNNN            ← XUSB companion (HMXInput.dll)
+SWD\HIDMAESTRO\HM_0000               ← XUSB companion (HMXInput.dll)
   │                                    SwDeviceCreate, System class, explicit
   │                                    per-controller ContainerID (shared with
   │                                    main HID for xinput1_4 dedup).
   │                                    UpperFilters = "xinputhid" from INF
   │                                    (admits the companion to WGI's XUSB
   │                                    dispatch; xinputhid.sys does not
-  │                                    actually attach — wrong device class).
-  │                                    `<sid>` = parent process PID in hex,
-  │                                    bypasses Windows' sticky per-container
-  │                                    fast-path that would empty-shell the
-  │                                    devnode on subsequent same-boot runs.
+  │                                    actually attach, wrong device class).
+  │                                    `HM_0000` = the identity token, the
+  │                                    same on every life of this controller.
   └─ XUSB interface → XInput slot + WGI Gamepad (one entry, live input +
                                      working put_Vibration on Chromium)
 ```
@@ -270,7 +300,7 @@ SWD\HIDMAESTRO\<sid>_NNNN            ← XUSB companion (HMXInput.dll)
 Profiles with `driverMode: "xinputhid"`. These match `xinputhid.inf [GIP_Hid]` by hardware ID (`HID\VID_045E&PID_0B13&IG_00`), which binds Microsoft's `xinputhid.sys` as an upper filter on the HID child. xinputhid provides XInput delivery + 16-button descriptor synthesis natively: no XUSB companion needed, single Device Manager entry.
 
 ```
-SWD\HIDMAESTRO_VID_045E_PID_0B13&IG_00\<sid>_NNNN
+SWD\HIDMAESTRO_VID_045E_PID_0B13&IG_00\HM_0000
   │                                  ← our UMDF2 driver via SwDeviceCreate
   │                                    (mshidumdf host). Explicit non-sentinel
   │                                    ContainerID closes the slot-1-skip
@@ -356,7 +386,7 @@ OK     System   HIDMaestro XInput Companion   SWD\HIDMAESTRO\A7B4_0002
 OK     HIDClass HID-compliant game controller HID\VID_045E&PID_028E&IG_00\...
 ```
 
-The `A7B4` prefix on the companion's instance-id suffix is the parent process's PID in hex, applied per-launch to bypass Windows PnP's sticky per-container fast-path. See Techniques: Session-Unique Instance-ID Suffix.
+The `A7B4` prefix on the companion's instance-id suffix in this capture is the per-process session id that releases v1.1.30 through v1.7.3 used; since v1.8.0 the suffix is the identity token. See Techniques: Stable Device Identity.
 </details>
 
 <details>
@@ -413,9 +443,10 @@ To reproduce: run `HIDMaestroTest.exe emulate <profile-id>`, then run `python sc
 | **XUSB** | Xbox USB protocol. The device interface GUID (`{EC87F1E3-...}`) that `xinput1_4.dll` discovers to find Xbox controllers, and the one WGI walks for XUSB-backed Gamepads. |
 | **WinExInput** | Windows Extended Input. A device interface GUID (`{6C53D5FD-...}`) registered on HID parents by HIDMaestro for historical reasons. Ghidra decomp of `Windows.Gaming.Input.dll` (Win11 26200) found zero references to this GUID; it is not actually WGI's `GamepadAdded` source. WGI admission comes from the HIDClass pass-list (plain HID profiles) or the xinputhid UpperFilter tripwire (Xbox XUSB-companion profiles). |
 | **xinputhid UpperFilter tripwire** | Registry string `"xinputhid"` written to a device's `DEVPKEY_Device_UpperFilters` (via INF HKR AddReg or SetupAPI) to satisfy WGI's `IsDeviceOrAncestorFilteredBy` wstring compare. Does not load `xinputhid.sys` — the filter only attaches to HID-class devices. Admits a System-class device (the XUSB companion at `SWD\HIDMAESTRO`) to WGI's XUSB dispatch path. See Techniques. |
-| **XUSB Companion** | A separate UMDF2 device (`HMXInput.dll`) that handles XUSB IOCTLs for XInput. Lives at `SWD\HIDMAESTRO\<sid>_NNNN`. Needed because `mshidumdf` suppresses XUSB on HID devices. |
+| **XUSB Companion** | A separate UMDF2 device (`HMXInput.dll`) that handles XUSB IOCTLs for XInput. Lives at `SWD\HIDMAESTRO\<token>`. Needed because `mshidumdf` suppresses XUSB on HID devices. |
 | **SWD enumerator** | "Software-device" PnP enumerator. Devices created via `SwDeviceCreate` (cfgmgr32) appear under `HKLM\SYSTEM\CurrentControlSet\Enum\SWD\<enumerator>\<instance>`. The SwDevice API lets us specify an explicit non-sentinel `pContainerId`, which is the linchpin of the slot-1-skip fix. |
-| **Session-id prefix** | Per-process unique token (the launching process's PID in hex) prepended to every SwD instance-id suffix. Bypasses Windows PnP's sticky per-`(enumerator + suffix + ContainerId)` reuse-fast-path that would otherwise leave subsequent same-boot devnodes as empty registry shells with no driver bound. |
+| **Identity token** | The instance-name segment every devnode of one virtual controller carries: `HM_0000` for the default key of index 0, `HM_` plus sixteen hex digits for a consumer key. Fixed across lives so the HID child keeps its path. Replaced the per-process session-id prefix in v1.8.0. See Techniques: Stable Device Identity. |
+| **ParentIdPrefix** | The `level&hash&n` value in a parent's instance key that PnP prepends to the instance id of every child that reports a non-unique id (HID children do). Read from the key when the child first arrives, minted with a fresh counter only when absent. HIDMaestro writes the identity's value so the child path is the same on every life. |
 | **ContainerID slot-1 skip** | Pre-fix bug in `xinput1_4!FUN_18000de2c`: a null-sentinel ContainerID `{00000000-...-FFFF-FFFFFFFFFFFF}` triggered a code path that set bit 2 on the device struct, made the fallback slot allocator skip iter 0, and surfaced an empty slot 1 to consumers. The SWD migration's explicit `pContainerId` closes the path. |
 | **GameInput mapping** | Registry entries at `HKLM\...\GameInput\Devices\{VID}{PID}...` that tell WGI how to map HID axes/buttons to the Gamepad interface. |
 | **&IG_** | "Interface Group" marker in Xbox device paths. Chrome and HIDAPI skip devices with this in the path; SDL3 falls through to its RawInput backend. |
